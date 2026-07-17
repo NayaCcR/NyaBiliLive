@@ -408,7 +408,7 @@ export function createApp({
     response.json(await maintainBilibiliAuth());
   });
 
-  app.delete("/api/admin/bilibili-auth", requireAdmin, (_request, response) => {
+  const clearBilibiliAuth = (_request, response) => {
     config.save({
       ...config.value,
       security: {
@@ -422,7 +422,10 @@ export function createApp({
     });
     danmakuCollector.restart();
     response.json({ ok: true, danmaku: danmakuCollector.status() });
-  });
+  };
+
+  app.post("/api/admin/bilibili-auth/clear", requireAdmin, clearBilibiliAuth);
+  app.delete("/api/admin/bilibili-auth", requireAdmin, clearBilibiliAuth);
 
   app.post("/api/admin/danmaku/restart", requireAdmin, (_request, response) => {
     danmakuCollector.restart();

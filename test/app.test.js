@@ -417,7 +417,7 @@ describe("administration and ingestion", () => {
     assert.equal(refresh.body.status, "fresh");
 
     const activeConnection = danmakuConnections.filter((item) => String(item.roomNumber) === "2468").at(-1);
-    const cleared = await agent.delete("/api/admin/bilibili-auth").send({}).expect(200);
+    const cleared = await agent.post("/api/admin/bilibili-auth/clear").send({}).expect(200);
     assert.equal(cleared.body.ok, true);
     assert.equal(cleared.body.danmaku.auth.mode, "guest");
     assert.equal(activeConnection.closed, true);
