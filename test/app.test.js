@@ -417,14 +417,18 @@ describe("administration and ingestion", () => {
     assert.equal(refresh.body.status, "fresh");
 
     const activeConnection = danmakuConnections.filter((item) => String(item.roomNumber) === "2468").at(-1);
-    const cleared = await agent.post("/api/admin/bilibili-auth/clear").send({}).expect(200);
-    assert.equal(cleared.body.ok, true);
-    assert.equal(cleared.body.danmaku.auth.mode, "guest");
+    const clearingConfig = await agent.get("/api/admin/config").expect(200);
+    for (const field of ["bilibili_cookie", "bilibili_web_refresh_token", "bilibili_app_access_key", "bilibili_app_refresh_token", "bilibili_app_expires_at"]) {
+      clearingConfig.body.security[field] = "";
+    }
+    await agent.put("/api/admin/config").send(clearingConfig.body).expect(200);
     assert.equal(activeConnection.closed, true);
     const clearedConfig = await agent.get("/api/admin/config").expect(200);
     for (const field of ["bilibili_cookie", "bilibili_web_refresh_token", "bilibili_app_access_key", "bilibili_app_refresh_token", "bilibili_app_expires_at"]) {
       assert.equal(clearedConfig.body.security[field], "");
     }
+    const clearedMonitor = await agent.get("/api/admin/monitor").expect(200);
+    assert.equal(clearedMonitor.body.danmaku.auth.mode, "guest");
   });
 
   test("synchronizes room metadata and manages the live session lifecycle", async () => {

@@ -290,8 +290,12 @@ async function verifyBilibiliAuth() {
 async function clearBilibiliAuth() {
   if (!confirm("确定清除当前 Bilibili Cookie、Web 与 APP 凭证吗？现有弹幕连接会立即断开并切回访客模式。")) return;
   try {
-    await api("/api/admin/bilibili-auth/clear", { method: "POST", body: "{}" });
-    await Promise.all([loadConfig(), loadMonitor()]);
+    const next = structuredClone(adminState.config);
+    for (const field of ["bilibili_cookie", "bilibili_web_refresh_token", "bilibili_app_access_key", "bilibili_app_refresh_token", "bilibili_app_expires_at"]) {
+      next.security[field] = "";
+    }
+    adminState.config = await api("/api/admin/config", { method: "PUT", body: JSON.stringify(next) });
+    await Promise.all([loadRooms(), loadMonitor()]);
     renderVisualConfig();
     toast("Bilibili 登录凭证已清除，采集器已切回访客模式");
   } catch (error) { toast(error.message, "error"); }

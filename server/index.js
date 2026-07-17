@@ -408,25 +408,6 @@ export function createApp({
     response.json(await maintainBilibiliAuth());
   });
 
-  const clearBilibiliAuth = (_request, response) => {
-    config.save({
-      ...config.value,
-      security: {
-        ...config.value.security,
-        bilibili_cookie: "",
-        bilibili_web_refresh_token: "",
-        bilibili_app_access_key: "",
-        bilibili_app_refresh_token: "",
-        bilibili_app_expires_at: "",
-      },
-    });
-    danmakuCollector.restart();
-    response.json({ ok: true, danmaku: danmakuCollector.status() });
-  };
-
-  app.post("/api/admin/bilibili-auth/clear", requireAdmin, clearBilibiliAuth);
-  app.delete("/api/admin/bilibili-auth", requireAdmin, clearBilibiliAuth);
-
   app.post("/api/admin/danmaku/restart", requireAdmin, (_request, response) => {
     danmakuCollector.restart();
     response.json({ ok: true, danmaku: danmakuCollector.status() });
