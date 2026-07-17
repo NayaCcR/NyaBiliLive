@@ -98,7 +98,7 @@ pnpm start
 - `config.json` 不会由静态文件服务公开；若通过 `NYABILILIVE_CONFIG` 指向 `static` 目录，服务会拒绝启动。Linux/macOS 每次保存配置后都会自动收紧为 `0600`。
 - Windows 的 `chmod` 不能替代 NTFS ACL。发行部署应使用专用系统账号运行，并执行 `icacls .\config.json /inheritance:r /grant:r "${env:USERNAME}:(R,W)"`，仅让运行账号读写配置。
 - 后台 Cookie 使用 `HttpOnly`、`SameSite=Strict`，HTTPS 请求会自动增加 `Secure`；后台和登录接口禁止缓存，浏览器跨来源写请求会被拒绝。
-- HTTPS 反向代理部署时设置 `NYABILILIVE_TRUST_PROXY=1`，让应用正确识别 HTTPS 并签发 `Secure` Cookie。该选项仅应在可信反向代理直接连接应用时启用。
+- 本机反向代理会被自动识别，以便正确处理 HTTPS 来源并签发 `Secure` Cookie。仅当可信反向代理不在本机时才设置 `NYABILILIVE_TRUST_PROXY=1`。
 
 - 默认后台账号为 `admin`，默认密码为 `nya123nya321`。首次使用默认密码登录后必须立即修改，完成前所有 `/api/admin/*` 接口都会拒绝访问。
 - `security.ingest_token` 是外部采集程序调用 `POST /api/ingest` 时使用的 Bearer Token，不是 Bilibili 凭证。

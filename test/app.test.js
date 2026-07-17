@@ -177,8 +177,25 @@ describe("administration and ingestion", () => {
       .send({ username: "admin", password: defaultAdminPassword })
       .expect(200);
     assert.match(login.headers["set-cookie"].join(";"), /samesite=strict/i);
+
+    const proxiedLogin = await request(app).post("/api/auth/login")
+      .set("Host", "live.example.test")
+      .set("Origin", "https://live.example.test")
+      .set("Sec-Fetch-Site", "same-origin")
+      .set("X-Forwarded-Proto", "https")
+      .send({ username: "admin", password: defaultAdminPassword })
+      .expect(200);
+    assert.match(proxiedLogin.headers["set-cookie"].join(";"), /secure/i);
+
+    await request(app).post("/api/auth/login")
+      .set("Host", "live.example.test")
+      .set("Origin", "https://live.example.test")
+      .send({ username: "admin", password: defaultAdminPassword })
+      .expect(200);
+
     await agent.post("/api/auth/logout")
       .set("Origin", "https://attacker.example")
+      .set("Sec-Fetch-Site", "cross-site")
       .send({})
       .expect(403);
   });

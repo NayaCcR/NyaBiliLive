@@ -50,11 +50,15 @@ const isInsideDirectory = (parent, candidate) => {
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 };
 const requestMatchesOrigin = (request) => {
+  const fetchSite = String(request.get("Sec-Fetch-Site") || "").toLowerCase();
+  if (fetchSite === "same-origin" || fetchSite === "none") return true;
+  if (fetchSite === "cross-site" || fetchSite === "same-site") return false;
   const source = request.get("Origin") || request.get("Referer");
   if (!source) return true;
   try {
-    const expected = new URL(`${request.protocol}://${request.get("host")}`).origin;
-    return new URL(source).origin === expected;
+    const sourceUrl = new URL(source);
+    const requestHost = String(request.get("host") || "").split(",")[0].trim().toLowerCase();
+    return sourceUrl.host.toLowerCase() === requestHost;
   } catch {
     return false;
   }
@@ -117,7 +121,7 @@ export function createApp({
   };
   const app = express();
 
-  if (environment.NYABILILIVE_TRUST_PROXY === "1") app.set("trust proxy", 1);
+  app.set("trust proxy", environment.NYABILILIVE_TRUST_PROXY === "1" ? 1 : "loopback");
 
   app.locals.config = config;
   app.locals.database = database;
