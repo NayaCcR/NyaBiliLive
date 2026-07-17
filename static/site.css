@@ -313,6 +313,8 @@ th:last-child, td:last-child { text-align: right; }
 .primary-button:hover { background: var(--primary-hover); }
 .secondary-button { border-color: var(--border-strong); background: white; color: var(--foreground); }
 .secondary-button:hover { border-color: rgba(235, 63, 152, .4); color: var(--primary); }
+.danger-button { border-color: rgba(185, 45, 58, .35); color: var(--red); }
+.danger-button:hover { border-color: var(--red); color: var(--red); }
 .primary-button.small, .secondary-button.small { min-height: 32px; }
 .editor-tabs { height: 43px; padding: 0 14px; }
 .config-form { padding: 20px; }

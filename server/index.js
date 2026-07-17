@@ -351,17 +351,17 @@ export function createApp({
   });
 
   app.get("/api/admin/bilibili-auth/qr/:key", requireAdmin, async (request, response) => {
-    const result = await bilibiliAuthClient.pollQrLogin(
-      String(request.params.key),
-      config.value.security.bilibili_cookie,
-    );
+    const result = await bilibiliAuthClient.pollQrLogin(String(request.params.key), "");
     if (result.status === "confirmed") {
       config.save({
         ...config.value,
         security: {
           ...config.value.security,
           bilibili_cookie: result.cookie,
-          bilibili_web_refresh_token: result.web_refresh_token || config.value.security.bilibili_web_refresh_token,
+          bilibili_web_refresh_token: result.web_refresh_token || "",
+          bilibili_app_access_key: "",
+          bilibili_app_refresh_token: "",
+          bilibili_app_expires_at: "",
         },
       });
       danmakuCollector.restart();
@@ -375,16 +375,14 @@ export function createApp({
   });
 
   app.get("/api/admin/bilibili-auth/app-qr/:key", requireAdmin, async (request, response) => {
-    const result = await bilibiliAuthClient.pollAppQrLogin(
-      String(request.params.key),
-      config.value.security.bilibili_cookie,
-    );
+    const result = await bilibiliAuthClient.pollAppQrLogin(String(request.params.key), "");
     if (result.status === "confirmed") {
       config.save({
         ...config.value,
         security: {
           ...config.value.security,
           bilibili_cookie: result.cookie,
+          bilibili_web_refresh_token: "",
           bilibili_app_access_key: result.app_access_key,
           bilibili_app_refresh_token: result.app_refresh_token,
           bilibili_app_expires_at: result.app_expires_at,
@@ -408,6 +406,22 @@ export function createApp({
 
   app.post("/api/admin/bilibili-auth/cookie-refresh", requireAdmin, async (_request, response) => {
     response.json(await maintainBilibiliAuth());
+  });
+
+  app.delete("/api/admin/bilibili-auth", requireAdmin, (_request, response) => {
+    config.save({
+      ...config.value,
+      security: {
+        ...config.value.security,
+        bilibili_cookie: "",
+        bilibili_web_refresh_token: "",
+        bilibili_app_access_key: "",
+        bilibili_app_refresh_token: "",
+        bilibili_app_expires_at: "",
+      },
+    });
+    danmakuCollector.restart();
+    response.json({ ok: true, danmaku: danmakuCollector.status() });
   });
 
   app.post("/api/admin/danmaku/restart", requireAdmin, (_request, response) => {

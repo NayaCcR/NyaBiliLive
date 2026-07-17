@@ -209,6 +209,7 @@ function renderVisualConfig() {
   const appTitle = auth.app_configured
     ? `APP 长效凭证 · ${auth.app_expires_at ? `${dateTime(auth.app_expires_at)} 到期` : "已配置"}`
     : "APP 长效凭证未配置";
+  const hasBilibiliCredentials = Boolean(c.security.bilibili_cookie || c.security.bilibili_web_refresh_token || c.security.bilibili_app_access_key || c.security.bilibili_app_refresh_token);
   editor.innerHTML = `<form class="config-form" id="config-form">
     <section class="config-section"><h3>站点</h3><div class="form-grid">
       ${field("站点名称", "app.site_name", c.app.site_name)}${field("副标题", "app.tagline", c.app.tagline)}
@@ -224,7 +225,7 @@ function renderVisualConfig() {
     <section class="config-section"><h3>安全</h3><div class="form-grid">${field("管理员账号", "security.admin_username", c.security.admin_username, "text", true, "登录管理后台使用的账号。")}${field("管理员密码", "security.admin_password", c.security.admin_password, "password", true, "管理后台密码；修改后请妥善保存。")}${field("采集令牌", "security.ingest_token", c.security.ingest_token, "password", true, "外部采集程序写入 /api/ingest 时使用的 Bearer Token。")}${field("会话签名密钥", "security.session_secret", c.security.session_secret, "password", true, "用于签名后台登录 Cookie；更换后所有管理员会话失效。")}</div></section>
     <section class="config-section"><h3>Bilibili 鉴权</h3>
       <div class="bili-auth-status"><span class="state-chip ${auth.mode === "authenticated" ? "online" : ""}">${escapeHtml(authTitle)}</span><span class="state-chip ${auth.app_configured ? "online" : ""}">${escapeHtml(appTitle)}</span></div>
-      <div class="bili-auth-actions"><button class="primary-button small" type="button" id="start-bili-login">Web 扫码登录</button><button class="primary-button small" type="button" id="start-bili-app-login">APP 扫码登录</button><button class="secondary-button small" type="button" id="verify-bili-auth" ${c.security.bilibili_cookie ? "" : "disabled"}>刷新登录状态</button><button class="secondary-button small" type="button" id="refresh-bili-cookie" ${c.security.bilibili_cookie ? "" : "disabled"}>检查 Cookie 续期</button></div>
+      <div class="bili-auth-actions"><button class="primary-button small" type="button" id="start-bili-login">Web 扫码登录</button><button class="primary-button small" type="button" id="start-bili-app-login">APP 扫码登录</button><button class="secondary-button small" type="button" id="verify-bili-auth" ${c.security.bilibili_cookie ? "" : "disabled"}>刷新登录状态</button><button class="secondary-button small" type="button" id="refresh-bili-cookie" ${c.security.bilibili_cookie ? "" : "disabled"}>检查 Cookie 续期</button><button class="secondary-button small danger-button" type="button" id="clear-bili-auth" ${hasBilibiliCredentials ? "" : "disabled"}>清除登录凭证</button></div>
       <div class="form-grid auth-secret-grid">${textareaField("完整 Cookie（可选）", "security.bilibili_cookie", c.security.bilibili_cookie, "也可以从已登录的 live.bilibili.com 请求中复制 Cookie")}${field("Web refresh_token（可选）", "security.bilibili_web_refresh_token", c.security.bilibili_web_refresh_token, "password", false)}</div>
       <p class="config-help">Web 扫码用于 Cookie 和官方 Cookie refresh；APP 扫码使用公开 APPKey 获取约 180 天的 access_key 与 refresh_token。两种方式均使用全球 passport.bilibili.com 接口，适用于香港部署。敏感凭证只保存在本机 config.json。</p>
     </section>
@@ -235,6 +236,7 @@ function renderVisualConfig() {
   editor.querySelector("#start-bili-app-login").addEventListener("click", () => startBilibiliLogin("app"));
   editor.querySelector("#verify-bili-auth").addEventListener("click", verifyBilibiliAuth);
   editor.querySelector("#refresh-bili-cookie").addEventListener("click", refreshBilibiliCookie);
+  editor.querySelector("#clear-bili-auth").addEventListener("click", clearBilibiliAuth);
 }
 
 const field = (label, name, value, type = "text", required = true, note = "") => `<label class="field"><span>${label}</span><input type="${type}" name="${name}" value="${escapeHtml(value)}" ${required ? "required" : ""}>${note ? `<small class="field-note">${escapeHtml(note)}</small>` : ""}</label>`;
@@ -282,6 +284,16 @@ async function verifyBilibiliAuth() {
     await Promise.all([loadConfig(), loadMonitor()]);
     renderVisualConfig();
     toast(`Cookie 有效：${profile.username}（UID ${profile.uid}）`);
+  } catch (error) { toast(error.message, "error"); }
+}
+
+async function clearBilibiliAuth() {
+  if (!confirm("确定清除当前 Bilibili Cookie、Web 与 APP 凭证吗？现有弹幕连接会立即断开并切回访客模式。")) return;
+  try {
+    await api("/api/admin/bilibili-auth", { method: "DELETE", body: "{}" });
+    await Promise.all([loadConfig(), loadMonitor()]);
+    renderVisualConfig();
+    toast("Bilibili 登录凭证已清除，采集器已切回访客模式");
   } catch (error) { toast(error.message, "error"); }
 }
 

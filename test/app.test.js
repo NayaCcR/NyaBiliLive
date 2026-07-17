@@ -52,8 +52,9 @@ beforeEach(() => {
       async createAppQrLogin() {
         return { key: "mock-app-key", image: "data:image/png;base64,YXBw" };
       },
-      async pollQrLogin(key) {
+      async pollQrLogin(key, existingCookie) {
         assert.equal(key, "mock-qr-key");
+        assert.equal(existingCookie, "");
         return {
           status: "confirmed",
           cookie: "SESSDATA=long-session; DedeUserID=24680; buvid3=mock-buvid",
@@ -64,8 +65,9 @@ beforeEach(() => {
         assert.match(cookie, /SESSDATA=long-session/);
         return { uid: "24680", username: "扫码测试账号", avatar_url: "" };
       },
-      async pollAppQrLogin(key) {
+      async pollAppQrLogin(key, existingCookie) {
         assert.equal(key, "mock-app-key");
+        assert.equal(existingCookie, "");
         return {
           status: "confirmed",
           cookie: "SESSDATA=app-session; DedeUserID=24680; buvid3=app-buvid",
@@ -346,6 +348,15 @@ describe("administration and ingestion", () => {
 
   test("stores QR login credentials and uses the authenticated danmaku identity", async () => {
     await loginAdmin();
+    const previous = await agent.get("/api/admin/config").expect(200);
+    Object.assign(previous.body.security, {
+      bilibili_cookie: "SESSDATA=old-session; DedeUserID=13579; buvid3=old-buvid",
+      bilibili_web_refresh_token: "old-web-refresh",
+      bilibili_app_access_key: "old-app-access",
+      bilibili_app_refresh_token: "old-app-refresh",
+      bilibili_app_expires_at: "2026-12-31T00:00:00.000Z",
+    });
+    await agent.put("/api/admin/config").send(previous.body).expect(200);
     const qr = await agent.post("/api/admin/bilibili-auth/qr").send({}).expect(200);
     assert.equal(qr.body.key, "mock-qr-key");
     assert.match(qr.body.image, /^data:image\/png/);
@@ -356,6 +367,9 @@ describe("administration and ingestion", () => {
 
     const config = await agent.get("/api/admin/config").expect(200);
     assert.match(config.body.security.bilibili_cookie, /DedeUserID=24680/);
+    assert.doesNotMatch(config.body.security.bilibili_cookie, /old-session|13579/);
+    assert.equal(config.body.security.bilibili_app_access_key, "");
+    assert.equal(config.body.security.bilibili_app_refresh_token, "");
     const verified = await agent.post("/api/admin/bilibili-auth/verify").send({}).expect(200);
     assert.equal(verified.body.uid, "24680");
     const monitor = await agent.get("/api/admin/monitor").expect(200);
@@ -395,11 +409,22 @@ describe("administration and ingestion", () => {
     const appConfig = await agent.get("/api/admin/config").expect(200);
     assert.equal(appConfig.body.security.bilibili_app_access_key, "app-access-secret");
     assert.equal(appConfig.body.security.bilibili_app_refresh_token, "app-refresh-secret");
+    assert.equal(appConfig.body.security.bilibili_web_refresh_token, "");
     const appMonitor = await agent.get("/api/admin/monitor").expect(200);
     assert.equal(appMonitor.body.danmaku.auth.app_configured, true);
     assert.equal(appMonitor.body.danmaku.auth.app_expires_at, "2027-01-13T00:00:00.000Z");
     const refresh = await agent.post("/api/admin/bilibili-auth/cookie-refresh").send({}).expect(200);
     assert.equal(refresh.body.status, "fresh");
+
+    const activeConnection = danmakuConnections.filter((item) => String(item.roomNumber) === "2468").at(-1);
+    const cleared = await agent.delete("/api/admin/bilibili-auth").send({}).expect(200);
+    assert.equal(cleared.body.ok, true);
+    assert.equal(cleared.body.danmaku.auth.mode, "guest");
+    assert.equal(activeConnection.closed, true);
+    const clearedConfig = await agent.get("/api/admin/config").expect(200);
+    for (const field of ["bilibili_cookie", "bilibili_web_refresh_token", "bilibili_app_access_key", "bilibili_app_refresh_token", "bilibili_app_expires_at"]) {
+      assert.equal(clearedConfig.body.security[field], "");
+    }
   });
 
   test("synchronizes room metadata and manages the live session lifecycle", async () => {

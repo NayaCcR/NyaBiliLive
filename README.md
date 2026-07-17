@@ -75,6 +75,8 @@ pnpm start
 
 即使已经登录，房间资料、开播状态、标题、封面和主播公开资料仍始终以访客状态请求，不携带 Cookie 或 APP access key。登录态只用于弹幕 WebSocket 获取未脱敏用户信息，以及凭证校验、刷新和续期。
 
+切换 Bilibili 账号时，新扫码结果会完整替换旧账号凭证，不会合并旧 Cookie；也可在管理后台点击“清除登录凭证”，一次清空 Web/APP 凭证并立即断开旧账号的弹幕连接。
+
 鉴权支持两条独立链路：
 
 - Web 扫码登录：保存 Cookie 与 Web `refresh_token`，服务启动时及每 24 小时检查官方 Cookie refresh 状态，需要时执行刷新与确认。
