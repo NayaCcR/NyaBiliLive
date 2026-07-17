@@ -145,7 +145,7 @@ async function restartDanmaku(event) {
 }
 
 function roomRows(rooms, actions = true) {
-  return rooms.map((room) => `<article class="admin-room-row" data-room-id="${room.id}"><span class="admin-avatar">${initials(room.streamer_name)}</span><span class="admin-room-copy"><strong>${escapeHtml(room.streamer_name)}</strong><small>/${escapeHtml(room.alias || room.room_number)} · ${count(room.session_count)} 场</small></span><span class="sync-cell"><span class="state-chip ${Number(room.live_status) === 1 ? "live" : ""}">${Number(room.live_status) === 1 ? "直播中" : "未开播"}</span><small class="${room.last_sync_error ? "error-text" : ""}">${room.last_sync_error ? escapeHtml(room.last_sync_error) : `${dateTime(room.last_sync_at)} 同步`}</small></span>${actions ? `<span class="row-actions"><button data-action="sync" title="立即同步">↻</button><button data-action="session" title="手动创建场次">＋</button><button data-action="edit" title="编辑房间">✎</button><button data-action="delete" title="删除房间">×</button></span>` : `<a class="room-open-link" href="/${encodeURIComponent(room.alias || room.room_number)}">查看</a>`}</article>`).join("") || '<div class="empty-inline">还没有直播间</div>';
+  return rooms.map((room, index) => `<article class="admin-room-row" data-room-id="${room.id}"><span class="admin-avatar">${initials(room.streamer_name)}</span><span class="admin-room-copy"><strong>${escapeHtml(room.streamer_name)}</strong><small>/${escapeHtml(room.alias || room.room_number)} · ${count(room.session_count)} 场</small></span><span class="sync-cell"><span class="state-chip ${Number(room.live_status) === 1 ? "live" : ""}">${Number(room.live_status) === 1 ? "直播中" : "未开播"}</span><small class="${room.last_sync_error ? "error-text" : ""}">${room.last_sync_error ? escapeHtml(room.last_sync_error) : `${dateTime(room.last_sync_at)} 同步`}</small></span>${actions ? `<span class="row-actions"><button data-action="up" title="上移房间" ${index === 0 ? "disabled" : ""}>↑</button><button data-action="down" title="下移房间" ${index === rooms.length - 1 ? "disabled" : ""}>↓</button><button data-action="sync" title="立即同步">↻</button><button data-action="session" title="手动创建场次">＋</button><button data-action="edit" title="编辑房间">✎</button><button data-action="delete" title="删除房间">×</button></span>` : `<a class="room-open-link" href="/${encodeURIComponent(room.alias || room.room_number)}">查看</a>`}</article>`).join("") || '<div class="empty-inline">还没有直播间</div>';
 }
 
 function renderRooms() {
@@ -154,11 +154,23 @@ function renderRooms() {
   document.querySelector("#add-room").addEventListener("click", () => openRoomModal());
   content.querySelectorAll("[data-action]").forEach((button) => {
     const room = adminState.rooms.find((item) => item.id === Number(button.closest("[data-room-id]").dataset.roomId));
+    if (["up", "down"].includes(button.dataset.action)) {
+      button.disabled = button.disabled || !adminState.managementEnabled;
+      button.addEventListener("click", () => moveRoom(room, button.dataset.action));
+    }
     if (button.dataset.action === "sync") button.addEventListener("click", () => syncRoom(room, button));
     if (button.dataset.action === "session") button.addEventListener("click", () => openSessionModal(room));
     if (button.dataset.action === "edit") { button.disabled = !adminState.managementEnabled; button.addEventListener("click", () => openRoomModal(room)); }
     if (button.dataset.action === "delete") { button.disabled = !adminState.managementEnabled; button.addEventListener("click", () => deleteRoom(room)); }
   });
+}
+
+async function moveRoom(room, direction) {
+  try {
+    const data = await api(`/api/admin/rooms/${room.id}/reorder`, { method: "POST", body: JSON.stringify({ direction }) });
+    adminState.rooms = data.items;
+    renderRooms();
+  } catch (error) { toast(error.message, "error"); }
 }
 
 async function syncRoom(room, button) {

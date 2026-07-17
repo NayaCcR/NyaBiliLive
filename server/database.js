@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS rooms (
   avatar_url TEXT NOT NULL DEFAULT '',
   description TEXT NOT NULL DEFAULT '',
   enabled INTEGER NOT NULL DEFAULT 1,
+  sort_order INTEGER NOT NULL DEFAULT 0,
   bili_uid TEXT,
   live_status INTEGER NOT NULL DEFAULT 0,
   last_checked_at TEXT,
@@ -123,6 +124,7 @@ export class ArchiveDatabase {
       ["room_parent_area", "TEXT NOT NULL DEFAULT ''"],
       ["attention", "INTEGER NOT NULL DEFAULT 0"],
       ["online", "INTEGER NOT NULL DEFAULT 0"],
+      ["sort_order", "INTEGER NOT NULL DEFAULT 0"],
     ];
     for (const [name, definition] of additions) {
       if (!roomColumns.has(name)) this.db.exec(`ALTER TABLE rooms ADD COLUMN ${name} ${definition}`);
@@ -134,8 +136,8 @@ export class ArchiveDatabase {
       roomByIdentifier: this.db.prepare("SELECT * FROM rooms WHERE (room_number = ? OR alias = ?) AND enabled = 1"),
       roomById: this.db.prepare("SELECT * FROM rooms WHERE id = ?"),
       insertRoom: this.db.prepare(`
-        INSERT INTO rooms (room_number, alias, streamer_name, avatar_url, description, enabled, created_at, updated_at)
-        VALUES (@room_number, NULLIF(@alias, ''), @streamer_name, @avatar_url, @description, @enabled, @created_at, @updated_at)
+        INSERT INTO rooms (room_number, alias, streamer_name, avatar_url, description, enabled, sort_order, created_at, updated_at)
+        VALUES (@room_number, NULLIF(@alias, ''), @streamer_name, @avatar_url, @description, @enabled, @sort_order, @created_at, @updated_at)
       `),
       deleteRoom: this.db.prepare("DELETE FROM rooms WHERE id = ?"),
       insertSession: this.db.prepare(`
@@ -233,7 +235,7 @@ export class ArchiveDatabase {
         (SELECT status FROM live_sessions recent WHERE recent.room_id = r.id ORDER BY recent.started_at DESC LIMIT 1) AS current_session_status
       FROM rooms r LEFT JOIN live_sessions s ON s.room_id = r.id
       ${enabledOnly ? "WHERE r.enabled = 1" : ""}
-      GROUP BY r.id ORDER BY r.enabled DESC, COALESCE(MAX(s.started_at), r.created_at) DESC
+      GROUP BY r.id ORDER BY r.sort_order ASC, r.id ASC
     `).all();
   }
 
@@ -271,10 +273,12 @@ export class ArchiveDatabase {
 
   createRoom(input) {
     const timestamp = now();
+    const nextOrder = this.db.prepare("SELECT COALESCE(MAX(sort_order), -1) + 1 AS value FROM rooms").get().value;
     const result = this.statements.insertRoom.run({
       ...input,
       streamer_name: input.streamer_name || `直播间 ${input.room_number}`,
       enabled: Number(input.enabled),
+      sort_order: nextOrder,
       created_at: timestamp,
       updated_at: timestamp,
     });
@@ -494,28 +498,29 @@ export class ArchiveDatabase {
   seedDemo() {
     const add = this.db.transaction(() => {
       const room = this.createRoom({
-        room_number: "21452505",
-        alias: "nya",
-        streamer_name: "Nya 的直播间",
+        room_number: "9213049",
+        alias: "naya",
+        streamer_name: "",
         avatar_url: "",
-        description: "音乐、杂谈与游戏，留住每一场直播的片段。",
+        description: "柳柳的直播间",
         enabled: true,
       });
       const current = Date.now();
       const sessions = [
         this.createSession(room.id, {
-          title: "夏夜歌回：在晚风里见面", cover_url: "", area: "视频唱见", parent_area: "娱乐",
-          started_at: new Date(current - 166 * 60_000).toISOString(), ended_at: "", status: "live",
-          peak_popularity: 12840, note: "今晚的歌单很轻，适合戴耳机。",
+          title: "测试场次 01 · 夏夜歌回", cover_url: "", area: "视频唱见", parent_area: "娱乐",
+          started_at: new Date(current - 166 * 60_000).toISOString(),
+          ended_at: new Date(current - 60 * 60_000).toISOString(), status: "ended",
+          peak_popularity: 12840, note: "初始化生成的测试场次，可在管理后台删除。",
         }),
         this.createSession(room.id, {
-          title: "独立游戏试玩与深夜杂谈", cover_url: "", area: "单机游戏", parent_area: "游戏",
+          title: "测试场次 02 · 独立游戏试玩", cover_url: "", area: "单机游戏", parent_area: "游戏",
           started_at: new Date(current - 3 * 86_400_000 - 3 * 3_600_000).toISOString(),
           ended_at: new Date(current - 3 * 86_400_000).toISOString(), status: "ended",
           peak_popularity: 9620, note: "",
         }),
         this.createSession(room.id, {
-          title: "周末电台：最近循环的十首歌", cover_url: "", area: "电台", parent_area: "娱乐",
+          title: "测试场次 03 · 周末电台", cover_url: "", area: "电台", parent_area: "娱乐",
           started_at: new Date(current - 8 * 86_400_000 - 2 * 3_600_000).toISOString(),
           ended_at: new Date(current - 8 * 86_400_000).toISOString(), status: "ended",
           peak_popularity: 7350, note: "",
@@ -557,4 +562,21 @@ export class ArchiveDatabase {
     });
     add();
   }
+
+  moveRoom(id, direction) {
+    const move = this.db.transaction(() => {
+      const rooms = this.db.prepare("SELECT id FROM rooms ORDER BY sort_order ASC, id ASC").all();
+      const index = rooms.findIndex((room) => room.id === id);
+      if (index < 0) return null;
+      const target = direction === "up" ? index - 1 : index + 1;
+      if (target < 0 || target >= rooms.length) return this.getRoomById(id);
+      [rooms[index], rooms[target]] = [rooms[target], rooms[index]];
+      const update = this.db.prepare("UPDATE rooms SET sort_order = ?, updated_at = ? WHERE id = ?");
+      const timestamp = now();
+      rooms.forEach((room, position) => update.run(position, timestamp, room.id));
+      return this.getRoomById(id);
+    });
+    return move();
+  }
+
 }

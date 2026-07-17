@@ -438,6 +438,13 @@ export function createApp({
     return response.json(result);
   });
 
+  app.post("/api/admin/rooms/:id/reorder", requireRoomManagement, (request, response, next) => {
+    const direction = parseOption(request.body?.direction, ["up", "down"], "", "移动方向");
+    const result = database.moveRoom(Number(request.params.id), direction);
+    if (!result) return next(httpError(404, "房间不存在"));
+    return response.json({ room: result, items: database.listRooms() });
+  });
+
   app.delete("/api/admin/rooms/:id", requireRoomManagement, (request, response, next) => {
     if (request.query.confirm !== "true") return next(httpError(400, "删除房间需要 confirm=true"));
     if (!database.deleteRoom(Number(request.params.id))) return next(httpError(404, "房间不存在"));

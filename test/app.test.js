@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import request from "supertest";
 import { createApp } from "../server/index.js";
+import { ArchiveDatabase } from "../server/database.js";
 
 const projectConfig = path.resolve("config.example.json");
 let directory;
@@ -36,7 +37,7 @@ beforeEach(() => {
   app = createApp({
     databasePath: path.join(directory, "test.db"),
     configPath,
-    seed: true,
+    seed: "demo",
     logger: false,
     bilibiliClient: {
       async fetchRoomSnapshot(roomNumber) {
@@ -101,22 +102,35 @@ afterEach(() => {
 });
 
 describe("public archive", () => {
+  test("seeds the production database with the default room and test sessions", () => {
+    const database = new ArchiveDatabase(path.join(directory, "production-seed.db"), { seed: true });
+    const rooms = database.listRooms();
+    assert.equal(rooms.length, 1);
+    assert.equal(rooms[0].room_number, "9213049");
+    assert.equal(rooms[0].alias, "naya");
+    assert.equal(rooms[0].avatar_url, "");
+    assert.equal(rooms[0].description, "柳柳的直播间");
+    assert.equal(database.counts().live_sessions, 3);
+    assert.ok(database.listSessions(rooms[0].id).every((session) => session.title.startsWith("测试场次") && session.status === "ended"));
+    database.close();
+  });
+
   test("serves the room path and seeded archive data", async () => {
-    await request(app).get("/nya").expect(200).expect("Content-Type", /html/);
+    await request(app).get("/naya").expect(200).expect("Content-Type", /html/);
     await request(app).get("/config.json").expect(404);
     await request(app).get("/.env").expect(404);
-    const room = await request(app).get("/api/rooms/nya").expect(200);
-    assert.equal(room.body.room_number, "21452505");
+    const room = await request(app).get("/api/rooms/naya").expect(200);
+    assert.equal(room.body.room_number, "9213049");
     assert.equal(room.body.sessions.length, 3);
 
-    const live = room.body.sessions.find((session) => session.status === "live");
-    const summary = await request(app).get(`/api/sessions/${live.id}/summary`).expect(200);
+    const sample = room.body.sessions[0];
+    const summary = await request(app).get(`/api/sessions/${sample.id}/summary`).expect(200);
     assert.ok(summary.body.stats.danmaku_count > 0);
     assert.ok(summary.body.stats.gift_revenue > 0);
   });
 
   test("filters audience by message count", async () => {
-    const room = await request(app).get("/api/rooms/nya").expect(200);
+    const room = await request(app).get("/api/rooms/naya").expect(200);
     const sessionId = room.body.sessions[0].id;
     const everyone = await request(app).get(`/api/sessions/${sessionId}/viewers?min_messages=0`).expect(200);
     const active = await request(app).get(`/api/sessions/${sessionId}/viewers?min_messages=5`).expect(200);
@@ -133,7 +147,7 @@ describe("public archive", () => {
   });
 
   test("orders danmaku and returns the complete gift history", async () => {
-    const room = await request(app).get("/api/rooms/nya").expect(200);
+    const room = await request(app).get("/api/rooms/naya").expect(200);
     const sessionId = room.body.sessions[0].id;
     const ascending = await request(app).get(`/api/sessions/${sessionId}/danmaku?order=asc&limit=200`).expect(200);
     const descending = await request(app).get(`/api/sessions/${sessionId}/danmaku?order=desc&limit=200`).expect(200);
@@ -219,6 +233,16 @@ describe("administration and ingestion", () => {
     }).expect(201);
     assert.equal(created.body.alias, "test-room");
 
+    const reordered = await agent.post(`/api/admin/rooms/${created.body.id}/reorder`)
+      .send({ direction: "up" })
+      .expect(200);
+    assert.equal(reordered.body.items[0].id, created.body.id);
+    const publicRooms = await request(app).get("/api/rooms").expect(200);
+    assert.equal(publicRooms.body.items[0].id, created.body.id);
+    await agent.post(`/api/admin/rooms/${created.body.id}/reorder`)
+      .send({ direction: "sideways" })
+      .expect(400);
+
     const session = await agent.post(`/api/admin/rooms/${created.body.id}/sessions`).send({
       title: "测试场次",
       area: "聊天电台",
@@ -232,7 +256,7 @@ describe("administration and ingestion", () => {
   });
 
   test("validates ingest tokens and updates reports", async () => {
-    const room = await request(app).get("/api/rooms/nya").expect(200);
+    const room = await request(app).get("/api/rooms/naya").expect(200);
     const sessionId = room.body.sessions[0].id;
     const event = {
       type: "danmaku",
