@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import request from "supertest";
 import { createApp } from "../server/index.js";
 import { ArchiveDatabase } from "../server/database.js";
+import { fetchBilibiliUserProfiles } from "../server/bilibili-profile.js";
 
 const projectConfig = path.resolve("config.example.json");
 let directory;
@@ -13,6 +14,10 @@ let app;
 let agent;
 let bilibiliSnapshot;
 let danmakuConnections;
+let profileRequests;
+let profileResponse;
+let mediaFetchCalls;
+let mediaFetchImpl;
 const defaultAdminPassword = "nya123nya321";
 const testAdminPassword = "test-admin-password-2026";
 
@@ -34,6 +39,12 @@ beforeEach(() => {
   fs.copyFileSync(projectConfig, configPath);
   bilibiliSnapshot = null;
   danmakuConnections = [];
+  profileRequests = [];
+  profileResponse = [];
+  mediaFetchCalls = 0;
+  mediaFetchImpl = async () => new Response(Buffer.from([137, 80, 78, 71]), {
+    headers: { "Content-Type": "image/png" },
+  });
   app = createApp({
     databasePath: path.join(directory, "test.db"),
     configPath,
@@ -93,6 +104,14 @@ beforeEach(() => {
       danmakuConnections.push(instance);
       return instance;
     },
+    async bilibiliUserProfileFetcher(uids) {
+      profileRequests.push([...uids]);
+      return profileResponse.filter((profile) => uids.includes(String(profile.uid)));
+    },
+    mediaFetch(...argumentsList) {
+      mediaFetchCalls += 1;
+      return mediaFetchImpl(...argumentsList);
+    },
   });
   agent = request.agent(app);
 });
@@ -129,6 +148,41 @@ describe("public archive", () => {
     const summary = await request(app).get(`/api/sessions/${sample.id}/summary`).expect(200);
     assert.ok(summary.body.stats.danmaku_count > 0);
     assert.ok(summary.body.stats.gift_revenue > 0);
+  });
+
+  test("caches proxied media and falls back to the Bilibili CDN after a timeout", async () => {
+    const source = "https://i0.hdslb.com/bfs/face/avatar-test.png";
+    mediaFetchImpl = async () => {
+      if (mediaFetchCalls === 1) throw new Error("temporary fetch failure");
+      return new Response(Buffer.from([137, 80, 78, 71]), { headers: { "Content-Type": "image/png" } });
+    };
+    await request(app).get(`/api/media?url=${encodeURIComponent(source)}`).expect(200).expect("Content-Type", /image\/png/);
+    await request(app).get(`/api/media?url=${encodeURIComponent(source)}`).expect(200);
+    assert.equal(mediaFetchCalls, 2);
+
+    mediaFetchImpl = async () => { throw Object.assign(new Error("request timed out"), { name: "TimeoutError", code: 23 }); };
+    const fallbackSource = "https://i1.hdslb.com/bfs/face/fallback.png";
+    const fallback = await request(app).get(`/api/media?url=${encodeURIComponent(fallbackSource)}`).expect(307);
+    assert.equal(fallback.headers.location, fallbackSource);
+    assert.equal(fallback.headers["referrer-policy"], "no-referrer");
+  });
+
+  test("requests batched user avatars from the authenticated VC endpoint", async () => {
+    let captured;
+    const profiles = await fetchBilibiliUserProfiles(["2", "3", "2", "guest:test"], {
+      cookie: "SESSDATA=test-session",
+      async fetchImpl(url, options) {
+        captured = { url: String(url), cookie: options.headers.Cookie };
+        return new Response(JSON.stringify({
+          code: 0,
+          data: [{ mid: 2, name: "测试用户", face: "https://i0.hdslb.com/bfs/face/test.jpg" }],
+        }), { headers: { "Content-Type": "application/json" } });
+      },
+    });
+    assert.equal(new URL(captured.url).hostname, "api.vc.bilibili.com");
+    assert.equal(new URL(captured.url).searchParams.get("uids"), "2,3");
+    assert.equal(captured.cookie, "SESSDATA=test-session");
+    assert.deepEqual(profiles, [{ uid: "2", username: "测试用户", avatar_url: "https://i0.hdslb.com/bfs/face/test.jpg" }]);
   });
 
   test("filters audience by message count", async () => {
@@ -311,11 +365,15 @@ describe("administration and ingestion", () => {
 
     const user = { uid: 778899, uname: "采集测试观众", face: "", identity: { guard_level: 0 } };
     connection.handler.onUserAction({ id: "enter-1", timestamp: 1_752_688_100_000, body: { action: "enter", timestamp: 1_752_688_100_000, user } });
-    connection.handler.onIncomeDanmu({ id: "danmaku-1", timestamp: 1_752_688_101_000, body: { timestamp: 1_752_688_101_000, user, content: "WebSocket 采集成功" } });
+    const rawDanmakuInfo = [];
+    rawDanmakuInfo[0] = [];
+    rawDanmakuInfo[0][15] = { user: { base: { face: "https://i0.hdslb.com/bfs/face/raw-avatar.jpg" } } };
+    connection.handler.onIncomeDanmu({ id: "danmaku-1", timestamp: 1_752_688_101_000, raw: { info: rawDanmakuInfo }, body: { timestamp: 1_752_688_101_000, user, content: "WebSocket 采集成功" } });
     connection.handler.onGift({ id: "gift-1", timestamp: 1_752_688_102_000, body: { user, gift_name: "小花花", coin_type: "gold", price: 1000, amount: 2 } });
 
     const danmaku = await request(app).get(`/api/sessions/${session.id}/danmaku?q=${encodeURIComponent("WebSocket 采集成功")}`).expect(200);
     assert.equal(danmaku.body.total, 1);
+    assert.equal(danmaku.body.items[0].avatar_url, "https://i0.hdslb.com/bfs/face/raw-avatar.jpg");
     const viewers = await request(app).get(`/api/sessions/${session.id}/viewers?q=${encodeURIComponent("采集测试观众")}`).expect(200);
     assert.equal(viewers.body.total, 1);
     assert.equal(viewers.body.items[0].message_count, 1);
@@ -342,6 +400,15 @@ describe("administration and ingestion", () => {
     assert.equal(recoveredStatus.status, "listening");
     assert.equal(recoveredStatus.last_error, "");
     assert.equal(recoveredStatus.message_count, 4);
+
+    const missingAvatarUser = { uid: 889900, uname: "等待头像补全", face: "", identity: { guard_level: 0 } };
+    profileResponse = [{ uid: "889900", username: "头像已补全", avatar_url: "https://i1.hdslb.com/bfs/face/enriched.jpg" }];
+    connection.handler.onIncomeDanmu({ id: "profile-enrichment", timestamp: 1_752_688_103_500, body: { timestamp: 1_752_688_103_500, user: missingAvatarUser, content: "等待批量补全头像" } });
+    await app.locals.danmakuCollector.flushProfileQueue();
+    const enriched = await request(app).get(`/api/sessions/${session.id}/danmaku?q=${encodeURIComponent("等待批量补全头像")}`).expect(200);
+    assert.deepEqual(profileRequests.at(-1), ["889900"]);
+    assert.equal(enriched.body.items[0].username, "等待头像补全");
+    assert.equal(enriched.body.items[0].avatar_url, "https://i1.hdslb.com/bfs/face/enriched.jpg");
 
     app.locals.danmakuCollector.stopRoom(created.body.id);
     connection.handler.onIncomeDanmu({ id: "stale-danmaku", timestamp: 1_752_688_104_000, body: { timestamp: 1_752_688_104_000, user, content: "旧连接不应写入" } });

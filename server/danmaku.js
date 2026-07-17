@@ -1,5 +1,10 @@
 import { startListen } from "blive-message-listener";
 import { parseBilibiliCookie } from "./bilibili-auth.js";
+import { fetchBilibiliUserProfiles } from "./bilibili-profile.js";
+
+const PROFILE_BATCH_SIZE = 20;
+const PROFILE_BATCH_DELAY = 1200;
+const PROFILE_RETRY_DELAY = 6 * 60 * 60 * 1000;
 
 function toIsoTimestamp(value) {
   const numeric = Number(value || Date.now());
@@ -8,27 +13,50 @@ function toIsoTimestamp(value) {
   return Number.isNaN(parsed.getTime()) ? new Date().toISOString() : parsed.toISOString();
 }
 
-function normalizeUser(user = {}, fallback = "anonymous") {
+function messageAvatar(message, user = {}) {
+  const candidates = [
+    user.face,
+    message.raw?.info?.[0]?.[15]?.user?.base?.face,
+    message.raw?.info?.[0]?.[15]?.user?.base?.origin_info?.face,
+    message.raw?.user_info?.face,
+    message.raw?.face,
+  ];
+  return String(candidates.find((value) => typeof value === "string" && value.trim()) || "");
+}
+
+function normalizeUser(user = {}, fallback = "anonymous", avatarUrl = "") {
   const uid = Number(user.uid || 0);
   const username = String(user.uname || user.username || "匿名观众");
   return {
     uid: uid > 0 ? String(uid) : `guest:${username || fallback}`,
     username,
-    avatar_url: String(user.face || ""),
+    avatar_url: String(avatarUrl || user.face || ""),
     guard_level: Number(user.identity?.guard_level || 0),
   };
 }
 
+function normalizeMessageUser(message, user = message.body?.user, fallback = message.id) {
+  return normalizeUser(user, fallback, messageAvatar(message, user));
+}
+
 export class DanmakuCollector {
-  constructor({ database, config, listenerFactory = startListen, logger = console } = {}) {
+  constructor({ database, config, listenerFactory = startListen, profileFetcher = fetchBilibiliUserProfiles, logger = console } = {}) {
     this.database = database;
     this.config = config;
     this.listenerFactory = listenerFactory;
+    this.profileFetcher = profileFetcher;
+    this.profileFetcherRequiresCookie = profileFetcher === fetchBilibiliUserProfiles;
     this.logger = logger;
     this.connections = new Map();
     this.timer = null;
     this.reconciling = false;
     this.lastReconcileAt = null;
+    this.pendingProfileUids = new Set();
+    this.profileAttempts = new Map();
+    this.profileTimer = null;
+    this.profileInFlight = false;
+    this.profileGeneration = 0;
+    this.lastProfileError = "";
   }
 
   status() {
@@ -47,6 +75,11 @@ export class DanmakuCollector {
         app_expires_at: this.config.value.security.bilibili_app_expires_at || null,
       },
       last_reconcile_at: this.lastReconcileAt,
+      profile_enrichment: {
+        pending: this.pendingProfileUids.size,
+        running: this.profileInFlight,
+        last_error: this.lastProfileError,
+      },
       rooms: [...this.connections.values()].map((connection) => ({
         room_id: connection.roomId,
         room_number: connection.roomNumber,
@@ -68,16 +101,81 @@ export class DanmakuCollector {
     this.timer = setInterval(() => this.reconcile(), interval);
     this.timer.unref?.();
     this.reconcile();
+    for (const user of this.database.listUsersMissingAvatars()) this.queueUserProfile(user);
   }
 
   stop() {
+    this.profileGeneration += 1;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    if (this.profileTimer) clearTimeout(this.profileTimer);
+    this.profileTimer = null;
+    this.profileInFlight = false;
+    this.pendingProfileUids.clear();
     for (const roomId of [...this.connections.keys()]) this.stopRoom(roomId);
   }
 
   restart() {
     this.start();
+  }
+
+  queueUserProfile(user) {
+    const uid = String(user?.uid || "");
+    if (!/^[1-9]\d*$/.test(uid)) return;
+    if (this.profileFetcherRequiresCookie) {
+      const cookie = this.config.value.security.bilibili_cookie.trim();
+      if (!parseBilibiliCookie(cookie).hasSessdata) return;
+    }
+    if (user?.avatar_url) {
+      this.pendingProfileUids.delete(uid);
+      return;
+    }
+    if (this.database.userHasAvatar(uid)) {
+      this.pendingProfileUids.delete(uid);
+      return;
+    }
+    const lastAttempt = this.profileAttempts.get(uid) || 0;
+    if (Date.now() - lastAttempt < PROFILE_RETRY_DELAY) return;
+    this.pendingProfileUids.add(uid);
+    this.scheduleProfileFlush();
+  }
+
+  scheduleProfileFlush(delay = PROFILE_BATCH_DELAY) {
+    if (this.profileTimer || this.profileInFlight || !this.pendingProfileUids.size) return;
+    const generation = this.profileGeneration;
+    this.profileTimer = setTimeout(() => {
+      this.profileTimer = null;
+      if (generation === this.profileGeneration) void this.flushProfileQueue();
+    }, delay);
+    this.profileTimer.unref?.();
+  }
+
+  async flushProfileQueue() {
+    if (this.profileInFlight || !this.pendingProfileUids.size) return;
+    const generation = this.profileGeneration;
+    const batch = [...this.pendingProfileUids].slice(0, PROFILE_BATCH_SIZE);
+    for (const uid of batch) {
+      this.pendingProfileUids.delete(uid);
+      this.profileAttempts.set(uid, Date.now());
+    }
+    this.profileInFlight = true;
+    try {
+      const profiles = await this.profileFetcher(batch, {
+        cookie: this.config.value.security.bilibili_cookie.trim(),
+      });
+      if (generation !== this.profileGeneration) return;
+      for (const profile of profiles) this.database.updateUserProfile(profile);
+      this.lastProfileError = "";
+    } catch (error) {
+      if (generation !== this.profileGeneration) return;
+      this.lastProfileError = error instanceof Error ? error.message : String(error);
+      this.logger.warn?.(`[danmaku] user profile enrichment: ${this.lastProfileError}`);
+    } finally {
+      if (generation === this.profileGeneration) {
+        this.profileInFlight = false;
+        this.scheduleProfileFlush();
+      }
+    }
   }
 
   reconcile() {
@@ -152,6 +250,7 @@ export class DanmakuCollector {
         const session = this.database.getActiveSessionForRoom(room.id);
         if (!session) return;
         this.database.ingest({ ...event, session_id: session.id });
+        this.queueUserProfile(event.user);
         connection.sessionId = session.id;
         recordEvent();
       } catch (error) {
@@ -172,7 +271,7 @@ export class DanmakuCollector {
         ingest({
           type: "danmaku",
           timestamp: toIsoTimestamp(body.timestamp || message.timestamp),
-          user: normalizeUser(body.user, message.id),
+          user: normalizeMessageUser(message, body.user),
           content: body.content,
           medal_name: body.user?.badge?.name || "",
           medal_level: Number(body.user?.badge?.level || 0),
@@ -183,7 +282,7 @@ export class DanmakuCollector {
         ingest({
           type: "enter",
           timestamp: toIsoTimestamp(message.body.timestamp || message.timestamp),
-          user: normalizeUser(message.body.user, message.id),
+          user: normalizeMessageUser(message, message.body.user),
         });
       },
       onGift: (message) => {
@@ -191,7 +290,7 @@ export class DanmakuCollector {
         ingest({
           type: "gift",
           timestamp: toIsoTimestamp(message.timestamp),
-          user: normalizeUser(body.user, message.id),
+          user: normalizeMessageUser(message, body.user),
           gift_name: body.gift_name,
           gift_icon_url: "",
           count: Math.max(1, Number(body.amount || 1)),
@@ -201,7 +300,7 @@ export class DanmakuCollector {
       },
       onIncomeSuperChat: (message) => {
         const body = message.body;
-        const user = normalizeUser(body.user, message.id);
+        const user = normalizeMessageUser(message, body.user);
         ingest({
           type: "danmaku",
           timestamp: toIsoTimestamp(message.timestamp),

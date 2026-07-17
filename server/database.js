@@ -158,6 +158,18 @@ export class ArchiveDatabase {
           guard_level = excluded.guard_level,
           updated_at = excluded.updated_at
       `),
+      updateUserProfile: this.db.prepare(`
+        UPDATE users SET
+          avatar_url = CASE WHEN @avatar_url != '' THEN @avatar_url ELSE avatar_url END,
+          updated_at = @updated_at
+        WHERE bili_uid = @uid
+      `),
+      usersMissingAvatars: this.db.prepare(`
+        SELECT bili_uid AS uid, username FROM users
+        WHERE avatar_url = '' AND bili_uid NOT LIKE 'guest:%'
+        ORDER BY id ASC LIMIT ?
+      `),
+      userAvatarByUid: this.db.prepare("SELECT avatar_url FROM users WHERE bili_uid = ?"),
       userId: this.db.prepare("SELECT id FROM users WHERE bili_uid = ?"),
       sessionExists: this.db.prepare("SELECT 1 FROM live_sessions WHERE id = ?"),
       ensureSessionUser: this.db.prepare(`
@@ -417,6 +429,22 @@ export class ArchiveDatabase {
 
   ingest(event) {
     return this.ingestTransaction(event);
+  }
+
+  updateUserProfile({ uid, avatar_url = "" }) {
+    return this.statements.updateUserProfile.run({
+      uid: String(uid),
+      avatar_url: String(avatar_url || ""),
+      updated_at: now(),
+    }).changes > 0;
+  }
+
+  listUsersMissingAvatars(limit = 5000) {
+    return this.statements.usersMissingAvatars.all(Math.max(1, Math.min(Number(limit) || 5000, 5000)));
+  }
+
+  userHasAvatar(uid) {
+    return Boolean(this.statements.userAvatarByUid.get(String(uid))?.avatar_url);
   }
 
   recordRoomSyncError(roomId, message) {

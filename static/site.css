@@ -190,7 +190,8 @@ a { color: inherit; }
 .user-avatar { width: 34px; height: 34px; flex: 0 0 34px; display: grid; place-items: center; overflow: hidden; border-radius: 50%; background: var(--muted); color: var(--muted-foreground); font-size: 9px; font-weight: 700; }
 .user-avatar[href] { text-decoration: none; transition: box-shadow .15s, transform .15s; }
 .user-avatar[href]:hover { box-shadow: 0 0 0 3px var(--primary-soft); transform: translateY(-1px); }
-.user-avatar img { width: 100%; height: 100%; object-fit: cover; }
+.user-avatar > * { grid-area: 1 / 1; }
+.user-avatar img { position: relative; z-index: 1; width: 100%; height: 100%; background: var(--muted); object-fit: cover; }
 .gift-row { min-height: 66px; display: grid; grid-template-columns: 36px minmax(0, 1fr) auto; align-items: center; gap: 10px; border-bottom: 1px solid var(--border); }
 .gift-icon { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 7px; background: var(--primary-soft); color: var(--primary); font-size: 9px; font-weight: 800; }
 .gift-history-section { margin-top: 28px; }

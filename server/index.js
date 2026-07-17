@@ -10,6 +10,7 @@ import { ArchiveDatabase } from "./database.js";
 import { BilibiliRoomMonitor } from "./bilibili.js";
 import { BilibiliAuthClient } from "./bilibili-auth.js";
 import { DanmakuCollector } from "./danmaku.js";
+import { BilibiliMediaProxy } from "./media.js";
 import { ConfigStore } from "./config.js";
 import {
   changePasswordSchema,
@@ -72,6 +73,8 @@ export function createApp({
   bilibiliClient,
   bilibiliAuthClient = new BilibiliAuthClient(),
   danmakuListenerFactory,
+  bilibiliUserProfileFetcher,
+  mediaFetch = fetch,
 } = {}) {
   if (isInsideDirectory(staticDirectory, path.resolve(configPath))) {
     throw new Error("NYABILILIVE_CONFIG 不能位于 static 公开目录内");
@@ -88,8 +91,10 @@ export function createApp({
     database,
     config,
     listenerFactory: danmakuListenerFactory,
+    profileFetcher: bilibiliUserProfileFetcher,
     logger: logger ? console : { info() {}, warn() {} },
   });
+  const mediaProxy = new BilibiliMediaProxy({ fetchImpl: mediaFetch });
   let authMaintenanceInFlight = false;
   let lastAuthMaintenance = null;
   const maintainBilibiliAuth = async () => {
@@ -127,6 +132,7 @@ export function createApp({
   app.locals.database = database;
   app.locals.monitor = monitor;
   app.locals.danmakuCollector = danmakuCollector;
+  app.locals.mediaProxy = mediaProxy;
   app.locals.bilibiliAuthClient = bilibiliAuthClient;
   app.locals.maintainBilibiliAuth = maintainBilibiliAuth;
   app.disable("x-powered-by");
@@ -206,29 +212,21 @@ export function createApp({
   app.get("/api/config", (_request, response) => response.json(config.publicValue()));
 
   app.get("/api/media", async (request, response, next) => {
+    let source;
     try {
-      const source = new URL(String(request.query.url || ""));
+      source = new URL(String(request.query.url || ""));
       const allowed = source.protocol === "https:"
         && (source.hostname === "hdslb.com" || source.hostname.endsWith(".hdslb.com"));
       if (!allowed) return next(httpError(400, "只允许代理 Bilibili 图片资源"));
-      const upstream = await fetch(source, {
-        headers: {
-          Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-          Referer: "https://live.bilibili.com/",
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
-        },
-        signal: AbortSignal.timeout(10_000),
-      });
-      if (!upstream.ok) return next(httpError(502, `图片源返回 ${upstream.status}`));
-      const contentType = upstream.headers.get("content-type") || "";
-      if (!contentType.startsWith("image/")) return next(httpError(502, "远端资源不是图片"));
-      const content = Buffer.from(await upstream.arrayBuffer());
-      if (content.length > 10 * 1024 * 1024) return next(httpError(413, "图片资源过大"));
-      response.set("Content-Type", contentType);
-      response.set("Cache-Control", "public, max-age=600, stale-while-revalidate=3600");
-      return response.send(content);
+      const asset = await mediaProxy.load(source.href);
+      response.set("Content-Type", asset.contentType);
+      response.set("Cache-Control", "public, max-age=86400, stale-while-revalidate=604800");
+      return response.send(asset.content);
     } catch (error) {
-      return next(error);
+      if (!source) return next(httpError(400, "图片地址无效"));
+      response.set("Referrer-Policy", "no-referrer");
+      response.set("Cache-Control", "no-store");
+      return response.redirect(307, source.href);
     }
   });
 
@@ -486,7 +484,7 @@ export function createApp({
       const detail = error.issues.map((issue) => `${issue.path.join(".") || "root"}: ${issue.message}`).join("；");
       return response.status(400).json({ error: `数据校验失败：${detail}` });
     }
-    if (error.code?.startsWith("SQLITE_CONSTRAINT")) {
+    if (typeof error.code === "string" && error.code.startsWith("SQLITE_CONSTRAINT")) {
       const message = error.code === "SQLITE_CONSTRAINT_FOREIGNKEY"
         ? "关联的房间或场次不存在"
         : "房间号、别名或记录标识已存在";

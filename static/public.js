@@ -19,6 +19,10 @@ const durationLabel = (start, end = Date.now()) => {
   return `${days ? `${days} 天 ` : ""}${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(rest).padStart(2, "0")}`;
 };
 
+document.addEventListener("error", (event) => {
+  if (event.target.matches?.(".user-avatar img")) event.target.remove();
+}, true);
+
 async function api(url, options = {}) {
   const response = await fetch(url, { ...options, headers: { "Content-Type": "application/json", ...(options.headers || {}) } });
   const payload = await response.json().catch(() => ({}));
@@ -234,7 +238,8 @@ async function refreshLiveSession(generation) {
 
 function userAvatar(user) {
   const uid = String(user.bili_uid || user.uid || "");
-  const content = user.avatar_url ? `<img src="${escapeHtml(mediaUrl(user.avatar_url))}" alt="">` : initials(user.username);
+  const fallback = `<span class="avatar-fallback">${escapeHtml(initials(user.username))}</span>`;
+  const content = user.avatar_url ? `${fallback}<img src="${escapeHtml(mediaUrl(user.avatar_url))}" alt="">` : fallback;
   if (/^[1-9]\d*$/.test(uid)) {
     return `<a class="user-avatar" href="https://space.bilibili.com/${encodeURIComponent(uid)}" target="_blank" rel="noopener" title="前往 ${escapeHtml(user.username)} 的个人空间">${content}</a>`;
   }
