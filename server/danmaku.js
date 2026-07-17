@@ -119,14 +119,26 @@ export class DanmakuCollector {
       lastError: "",
       handshakeTimer: null,
       retryAt: null,
+      stopped: false,
     };
     this.connections.set(room.id, connection);
-    const recordEvent = () => { connection.lastEventAt = new Date().toISOString(); connection.messageCount += 1; };
+    const isCurrent = () => !connection.stopped && this.connections.get(room.id) === connection;
+    const recordEvent = () => {
+      if (!isCurrent()) return;
+      clearHandshakeTimer();
+      connection.status = "listening";
+      connection.connectedAt ||= new Date().toISOString();
+      connection.lastError = "";
+      connection.retryAt = null;
+      connection.lastEventAt = new Date().toISOString();
+      connection.messageCount += 1;
+    };
     const clearHandshakeTimer = () => {
       if (connection.handshakeTimer) clearTimeout(connection.handshakeTimer);
       connection.handshakeTimer = null;
     };
     const reportError = (error) => {
+      if (!isCurrent()) return;
       clearHandshakeTimer();
       const message = error instanceof Error ? error.message : String(error);
       connection.status = "error";
@@ -135,6 +147,7 @@ export class DanmakuCollector {
       this.logger.warn?.(`[danmaku] room ${room.room_number}: ${message}`);
     };
     const ingest = (event) => {
+      if (!isCurrent()) return;
       try {
         const session = this.database.getActiveSessionForRoom(room.id);
         if (!session) return;
@@ -146,12 +159,13 @@ export class DanmakuCollector {
       }
     };
     const handler = {
-      onOpen: () => { connection.status = "connected"; connection.connectedAt = new Date().toISOString(); connection.lastError = ""; connection.retryAt = null; },
+      onOpen: () => { if (!isCurrent()) return; connection.status = "connected"; connection.connectedAt = new Date().toISOString(); connection.lastError = ""; connection.retryAt = null; },
       onStartListen: () => {
+        if (!isCurrent()) return;
         clearHandshakeTimer(); connection.status = "listening"; connection.connectedAt ||= new Date().toISOString(); connection.lastError = ""; connection.retryAt = null;
         this.logger.info?.(`[danmaku] listening room ${room.room_number}, uid ${parseBilibiliCookie(this.config.value.security.bilibili_cookie).uid || 0}`);
       },
-      onClose: () => { clearHandshakeTimer(); connection.status = "closed"; connection.lastError = "连接已关闭，30 秒后重试"; connection.retryAt = Date.now() + 30_000; },
+      onClose: () => { if (!isCurrent()) return; clearHandshakeTimer(); connection.status = "closed"; connection.lastError = "连接已关闭，30 秒后重试"; connection.retryAt = Date.now() + 30_000; },
       onError: reportError,
       onIncomeDanmu: (message) => {
         const body = message.body;
@@ -208,6 +222,7 @@ export class DanmakuCollector {
         });
       },
       onAttentionChange: (message) => {
+        if (!isCurrent()) return;
         try {
           const session = this.database.getActiveSessionForRoom(room.id);
           if (session) this.database.updateSession(session.id, {
@@ -245,6 +260,7 @@ export class DanmakuCollector {
   stopRoom(roomId) {
     const connection = this.connections.get(roomId);
     if (!connection) return;
+    connection.stopped = true;
     if (connection.handshakeTimer) clearTimeout(connection.handshakeTimer);
     try { connection.instance?.close?.(); } catch {}
     this.connections.delete(roomId);

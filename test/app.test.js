@@ -329,6 +329,24 @@ describe("administration and ingestion", () => {
     const status = monitor.body.danmaku.rooms.find((item) => item.room_number === "7788");
     assert.equal(status.status, "listening");
     assert.equal(status.message_count, 3);
+
+    connection.handler.onClose();
+    const closedMonitor = await agent.get("/api/admin/monitor").expect(200);
+    const closedStatus = closedMonitor.body.danmaku.rooms.find((item) => item.room_number === "7788");
+    assert.equal(closedStatus.status, "closed");
+    assert.match(closedStatus.last_error, /连接已关闭/);
+
+    connection.handler.onIncomeDanmu({ id: "danmaku-after-close", timestamp: 1_752_688_103_000, body: { timestamp: 1_752_688_103_000, user, content: "关闭事件后的有效弹幕" } });
+    const recoveredMonitor = await agent.get("/api/admin/monitor").expect(200);
+    const recoveredStatus = recoveredMonitor.body.danmaku.rooms.find((item) => item.room_number === "7788");
+    assert.equal(recoveredStatus.status, "listening");
+    assert.equal(recoveredStatus.last_error, "");
+    assert.equal(recoveredStatus.message_count, 4);
+
+    app.locals.danmakuCollector.stopRoom(created.body.id);
+    connection.handler.onIncomeDanmu({ id: "stale-danmaku", timestamp: 1_752_688_104_000, body: { timestamp: 1_752_688_104_000, user, content: "旧连接不应写入" } });
+    const staleResult = await request(app).get(`/api/sessions/${session.id}/danmaku?q=${encodeURIComponent("旧连接不应写入")}`).expect(200);
+    assert.equal(staleResult.body.total, 0);
   });
 
   test("configuration switch disables room mutations", async () => {

@@ -1,5 +1,5 @@
 const overviewCollapsed = (() => { try { return localStorage.getItem("nyabililive:overview-collapsed") === "true"; } catch { return false; } })();
-const state = { config: null, room: null, session: null, activeTab: "gifts", danmakuOffset: 0, danmakuOrder: "desc", viewerOffset: 0, viewerSort: "last_entered_at", viewerOrder: "desc", durationTimer: null, overviewCollapsed, giftData: null, giftMode: "overview", giftUserId: null, giftHistoryOrder: "desc" };
+const state = { config: null, room: null, session: null, activeTab: "gifts", danmakuOffset: 0, danmakuOrder: "desc", viewerOffset: 0, viewerSort: "last_entered_at", viewerOrder: "desc", durationTimer: null, liveRefreshTimer: null, liveRefreshInFlight: false, liveRefreshGeneration: 0, danmakuRenderedOnce: false, danmakuSignature: "", viewerSignature: "", overviewCollapsed, giftData: null, giftSignature: "", giftMode: "overview", giftUserId: null, giftHistoryOrder: "desc" };
 const app = document.querySelector("#app");
 const escapeHtml = (value = "") => String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;");
 const count = (value) => new Intl.NumberFormat("zh-CN").format(Number(value || 0));
@@ -77,6 +77,7 @@ function createRoomCard(room) {
 }
 
 async function renderRoom(identifier) {
+  stopLiveRefresh();
   state.room = await api(`/api/rooms/${encodeURIComponent(identifier)}`);
   app.replaceChildren(document.querySelector("#room-template").content.cloneNode(true));
   document.querySelector("#session-count").textContent = `${state.room.sessions.length} 个场次`;
@@ -137,19 +138,29 @@ function renderSessionStrip() {
 }
 
 async function selectSession(sessionId) {
+  stopLiveRefresh();
+  const selectionGeneration = state.liveRefreshGeneration;
   if (state.durationTimer) { clearInterval(state.durationTimer); state.durationTimer = null; }
   state.session = state.room.sessions.find((session) => session.id === sessionId);
   state.danmakuOffset = 0;
   state.viewerOffset = 0;
   state.giftUserId = null;
+  state.danmakuRenderedOnce = false;
+  state.danmakuSignature = "";
+  state.viewerSignature = "";
   document.querySelectorAll(".session-card").forEach((card) => card.classList.toggle("active", Number(card.dataset.sessionId) === sessionId));
   try {
     const [summary, gifts] = await Promise.all([api(`/api/sessions/${sessionId}/summary`), api(`/api/sessions/${sessionId}/gifts`)]);
+    if (selectionGeneration !== state.liveRefreshGeneration || state.session?.id !== sessionId) return;
     renderSessionSummary(summary); renderGifts(gifts); await loadActiveTab();
+    if (selectionGeneration !== state.liveRefreshGeneration || state.session?.id !== sessionId) return;
+    startLiveRefresh(summary);
   } catch (error) { toast(error.message, "error"); }
 }
 
 function renderSessionSummary(session) {
+  state.session = { ...state.session, ...session };
+  if (state.durationTimer) { clearInterval(state.durationTimer); state.durationTimer = null; }
   document.querySelector("#collapsed-session-title").textContent = session.title;
   document.querySelector("#session-state").textContent = session.status === "live" ? "LIVE · 直播中" : "已结束";
   document.querySelector("#session-state").className = session.status === "live" ? "live" : "";
@@ -185,6 +196,42 @@ async function loadActiveTab() {
   if (state.activeTab === "viewers") await loadViewers();
 }
 
+function stopLiveRefresh() {
+  if (state.liveRefreshTimer) clearInterval(state.liveRefreshTimer);
+  state.liveRefreshTimer = null;
+  state.liveRefreshInFlight = false;
+  state.liveRefreshGeneration += 1;
+}
+
+function startLiveRefresh(session) {
+  stopLiveRefresh();
+  if (session.status !== "live" || session.ended_at) return;
+  const generation = state.liveRefreshGeneration;
+  state.liveRefreshTimer = setInterval(() => refreshLiveSession(generation), 3000);
+}
+
+async function refreshLiveSession(generation) {
+  if (generation !== state.liveRefreshGeneration || document.hidden || state.liveRefreshInFlight || !state.session) return;
+  const sessionId = state.session.id;
+  state.liveRefreshInFlight = true;
+  try {
+    const summary = await api(`/api/sessions/${sessionId}/summary`);
+    if (generation !== state.liveRefreshGeneration || state.session?.id !== sessionId) return;
+    renderSessionSummary(summary);
+    if (summary.status !== "live" || summary.ended_at) { stopLiveRefresh(); return; }
+    const panel = document.querySelector(`#panel-${state.activeTab}`);
+    if (panel?.contains(document.activeElement)) return;
+    if (state.activeTab === "gifts") {
+      const gifts = await api(`/api/sessions/${sessionId}/gifts`);
+      if (generation !== state.liveRefreshGeneration || state.session?.id !== sessionId) return;
+      if (giftDataSignature(gifts) !== state.giftSignature) renderGifts(gifts);
+    }
+    if (state.activeTab === "danmaku") await loadDanmaku(false, { silent: true, animateNew: true, sessionId });
+    if (state.activeTab === "viewers") await loadViewers(false, { silent: true, sessionId });
+  } catch {}
+  finally { if (generation === state.liveRefreshGeneration) state.liveRefreshInFlight = false; }
+}
+
 function userAvatar(user) {
   const uid = String(user.bili_uid || user.uid || "");
   const content = user.avatar_url ? `<img src="${escapeHtml(mediaUrl(user.avatar_url))}" alt="">` : initials(user.username);
@@ -196,10 +243,16 @@ function userAvatar(user) {
 
 function renderGifts(data) {
   state.giftData = data;
+  state.giftSignature = giftDataSignature(data);
   if (!state.giftUserId || !data.ranking.some((user) => String(user.bili_uid) === state.giftUserId)) {
     state.giftUserId = data.ranking.length ? String(data.ranking[0].bili_uid) : null;
   }
   renderGiftPanel();
+}
+
+function giftDataSignature(data) {
+  const latest = data.history?.[0];
+  return `${data.history_total ?? data.history?.length ?? 0}:${latest?.id ?? ""}:${latest?.received_at ?? ""}`;
 }
 
 function giftHistoryRows(items) {
@@ -254,15 +307,25 @@ function renderGiftPanel() {
   });
 }
 
-async function loadDanmaku(reset = true) {
+async function loadDanmaku(reset = true, { silent = false, animateNew = false, sessionId = state.session?.id } = {}) {
   if (reset) state.danmakuOffset = 0;
   const panel = document.querySelector("#panel-danmaku");
   const query = panel.querySelector("#danmaku-search")?.value || "";
-  panel.innerHTML = '<div class="panel-loading">读取弹幕记录…</div>';
+  const previousIds = new Set([...panel.querySelectorAll("[data-danmaku-id]")].map((row) => row.dataset.danmakuId));
+  if (!silent) panel.innerHTML = '<div class="panel-loading">读取弹幕记录…</div>';
   try {
     const limit = state.config.display.danmaku_page_size;
-    const data = await api(`/api/sessions/${state.session.id}/danmaku?q=${encodeURIComponent(query)}&limit=${limit}&offset=${state.danmakuOffset}&order=${state.danmakuOrder}`);
-    panel.innerHTML = `<header class="data-title responsive"><div><p class="kicker">DANMAKU HISTORY</p><h3>弹幕历史</h3></div><form class="search-form" id="danmaku-form"><input id="danmaku-search" type="search" value="${escapeHtml(query)}" placeholder="搜索弹幕、用户或 UID"><button>搜索</button></form></header><div class="list-toolbar"><p class="result-note">${count(data.total)} 条记录</p><nav class="segmented-control" aria-label="弹幕发送时间排序"><button type="button" data-danmaku-order="desc" class="${state.danmakuOrder === "desc" ? "active" : ""}">最新优先</button><button type="button" data-danmaku-order="asc" class="${state.danmakuOrder === "asc" ? "active" : ""}">最早优先</button></nav></div><div class="danmaku-list">${data.items.map((item) => `<article class="danmaku-row">${userAvatar(item)}<div><header><strong>${escapeHtml(item.username)}</strong>${item.medal_name ? `<span class="medal">${escapeHtml(item.medal_name)} ${item.medal_level}</span>` : ""}<time>${formatTimestamp(item.sent_at)}</time></header><p>${escapeHtml(item.content)}</p></div></article>`).join("") || '<div class="empty-inline">没有符合条件的弹幕</div>'}</div><div class="pagination"><button id="danmaku-prev" ${state.danmakuOffset === 0 ? "disabled" : ""}>上一页</button><button id="danmaku-next" ${state.danmakuOffset + data.items.length >= data.total ? "disabled" : ""}>下一页</button></div>`;
+    const data = await api(`/api/sessions/${sessionId}/danmaku?q=${encodeURIComponent(query)}&limit=${limit}&offset=${state.danmakuOffset}&order=${state.danmakuOrder}`);
+    if (state.session?.id !== sessionId) return;
+    const signature = `${data.total}:${data.items.map((item) => item.id).join(",")}`;
+    if (silent && signature === state.danmakuSignature) return;
+    const rows = data.items.map((item) => {
+      const arriving = animateNew && state.danmakuRenderedOnce && !previousIds.has(String(item.id));
+      return `<article class="danmaku-row${arriving ? " live-arrival" : ""}" data-danmaku-id="${item.id}">${userAvatar(item)}<div><header><strong>${escapeHtml(item.username)}</strong>${item.medal_name ? `<span class="medal">${escapeHtml(item.medal_name)} ${item.medal_level}</span>` : ""}<time>${formatTimestamp(item.sent_at)}</time></header><p>${escapeHtml(item.content)}</p></div></article>`;
+    }).join("") || '<div class="empty-inline">没有符合条件的弹幕</div>';
+    panel.innerHTML = `<header class="data-title responsive"><div><p class="kicker">DANMAKU HISTORY</p><h3>弹幕历史</h3></div><form class="search-form" id="danmaku-form"><input id="danmaku-search" type="search" value="${escapeHtml(query)}" placeholder="搜索弹幕、用户或 UID"><button>搜索</button></form></header><div class="list-toolbar"><p class="result-note">${count(data.total)} 条记录</p><nav class="segmented-control" aria-label="弹幕发送时间排序"><button type="button" data-danmaku-order="desc" class="${state.danmakuOrder === "desc" ? "active" : ""}">最新优先</button><button type="button" data-danmaku-order="asc" class="${state.danmakuOrder === "asc" ? "active" : ""}">最早优先</button></nav></div><div class="danmaku-list">${rows}</div><div class="pagination"><button id="danmaku-prev" ${state.danmakuOffset === 0 ? "disabled" : ""}>上一页</button><button id="danmaku-next" ${state.danmakuOffset + data.items.length >= data.total ? "disabled" : ""}>下一页</button></div>`;
+    state.danmakuRenderedOnce = true;
+    state.danmakuSignature = signature;
     panel.querySelector("#danmaku-form").addEventListener("submit", (event) => { event.preventDefault(); loadDanmaku(true); });
     panel.querySelectorAll("[data-danmaku-order]").forEach((button) => button.addEventListener("click", () => { state.danmakuOrder = button.dataset.danmakuOrder; loadDanmaku(true); }));
     panel.querySelector("#danmaku-prev").addEventListener("click", () => { state.danmakuOffset = Math.max(0, state.danmakuOffset - limit); loadDanmaku(false); });
@@ -270,21 +333,25 @@ async function loadDanmaku(reset = true) {
   } catch (error) { panel.innerHTML = `<div class="empty-inline error">${escapeHtml(error.message)}</div>`; }
 }
 
-async function loadViewers(reset = false) {
+async function loadViewers(reset = false, { silent = false, sessionId = state.session?.id } = {}) {
   if (reset) state.viewerOffset = 0;
   const panel = document.querySelector("#panel-viewers");
   const minimum = panel.querySelector("#message-min")?.value ?? state.config.display.default_min_messages;
   const query = panel.querySelector("#viewer-search")?.value || "";
-  panel.innerHTML = '<div class="panel-loading">整理观众记录…</div>';
+  if (!silent) panel.innerHTML = '<div class="panel-loading">整理观众记录…</div>';
   try {
     const limit = 100;
-    const data = await api(`/api/sessions/${state.session.id}/viewers?min_messages=${encodeURIComponent(minimum)}&q=${encodeURIComponent(query)}&limit=${limit}&offset=${state.viewerOffset}&sort=${state.viewerSort}&order=${state.viewerOrder}`);
+    const data = await api(`/api/sessions/${sessionId}/viewers?min_messages=${encodeURIComponent(minimum)}&q=${encodeURIComponent(query)}&limit=${limit}&offset=${state.viewerOffset}&sort=${state.viewerSort}&order=${state.viewerOrder}`);
+    if (state.session?.id !== sessionId) return;
+    const signature = `${data.total}:${data.items.map((item) => `${item.bili_uid}:${item.last_entered_at}:${item.entry_count}:${item.message_count}`).join(",")}`;
+    if (silent && signature === state.viewerSignature) return;
     panel.innerHTML = `<header class="data-title responsive"><div><p class="kicker">AUDIENCE LOG</p><h3>进房与发言用户</h3></div><form class="viewer-filters" id="viewer-form"><label>至少发言 <input id="message-min" type="number" min="0" value="${Number(minimum)}"> 条</label><input id="viewer-search" type="search" value="${escapeHtml(query)}" placeholder="用户名或 UID"><button>筛选</button></form></header><div class="list-toolbar"><p class="result-note">显示 ${count(data.total)} 位用户</p><div class="sort-controls"><label class="sort-select">排序依据 <select id="viewer-sort"><option value="last_entered_at" ${state.viewerSort === "last_entered_at" ? "selected" : ""}>最近进入时间</option><option value="first_entered_at" ${state.viewerSort === "first_entered_at" ? "selected" : ""}>首次进入时间</option></select></label><nav class="segmented-control" aria-label="进房用户排序方向"><button type="button" data-viewer-order="desc" class="${state.viewerOrder === "desc" ? "active" : ""}">倒序</button><button type="button" data-viewer-order="asc" class="${state.viewerOrder === "asc" ? "active" : ""}">正序</button></nav></div></div><div class="table-wrap"><table><thead><tr><th>用户</th><th>UID</th><th>首次进入</th><th>最近进入</th><th>进入</th><th>发言</th></tr></thead><tbody>${data.items.map((item) => `<tr><td><span class="user-cell">${userAvatar(item)}<strong>${escapeHtml(item.username)}</strong></span></td><td>${escapeHtml(item.bili_uid)}</td><td>${formatTimestamp(item.first_entered_at)}</td><td>${formatTimestamp(item.last_entered_at)}</td><td>${count(item.entry_count)}</td><td><strong>${count(item.message_count)}</strong></td></tr>`).join("") || '<tr><td colspan="6" class="empty-cell">没有符合条件的用户</td></tr>'}</tbody></table></div><div class="pagination"><button id="viewer-prev" ${state.viewerOffset === 0 ? "disabled" : ""}>上一页</button><button id="viewer-next" ${state.viewerOffset + data.items.length >= data.total ? "disabled" : ""}>下一页</button></div>`;
     panel.querySelector("#viewer-form").addEventListener("submit", (event) => { event.preventDefault(); loadViewers(true); });
     panel.querySelector("#viewer-sort").addEventListener("change", (event) => { state.viewerSort = event.currentTarget.value; loadViewers(true); });
     panel.querySelectorAll("[data-viewer-order]").forEach((button) => button.addEventListener("click", () => { state.viewerOrder = button.dataset.viewerOrder; loadViewers(true); }));
     panel.querySelector("#viewer-prev").addEventListener("click", () => { state.viewerOffset = Math.max(0, state.viewerOffset - limit); loadViewers(false); });
     panel.querySelector("#viewer-next").addEventListener("click", () => { state.viewerOffset += limit; loadViewers(false); });
+    state.viewerSignature = signature;
   } catch (error) { panel.innerHTML = `<div class="empty-inline error">${escapeHtml(error.message)}</div>`; }
 }
 

@@ -237,6 +237,12 @@ a { color: inherit; }
 .danmaku-row header strong { font-size: 11px; }
 .danmaku-row time { margin-left: auto; color: #9a979e; font-size: 9px; }
 .danmaku-row p { margin: 5px 0 0; font-size: 12px; line-height: 1.55; overflow-wrap: anywhere; }
+.danmaku-row.live-arrival { animation: danmaku-arrive .7s ease both; }
+@keyframes danmaku-arrive {
+  0% { opacity: 0; transform: translateY(-10px); background: var(--primary-soft); }
+  55% { background: var(--primary-soft); }
+  100% { opacity: 1; transform: translateY(0); background: transparent; }
+}
 .medal { padding: 2px 5px; border: 1px solid rgba(235, 63, 152, .22); border-radius: 4px; background: var(--primary-soft); color: var(--primary); font-size: 8px; }
 .pagination { display: flex; justify-content: flex-end; gap: 7px; margin-top: 14px; }
 .viewer-filters label { display: flex; align-items: center; gap: 5px; color: var(--muted-foreground); font-size: 10px; white-space: nowrap; }
@@ -362,6 +368,10 @@ th:last-child, td:last-child { text-align: right; }
 .qr-login-body img { width: 240px; max-width: 100%; aspect-ratio: 1; border: 1px solid var(--border); border-radius: 6px; }
 .qr-login-body strong { margin-top: 4px; font-size: 12px; }
 .qr-login-body p { margin: 0; color: var(--muted-foreground); font-size: 10px; line-height: 1.6; }
+
+@media (prefers-reduced-motion: reduce) {
+  .danmaku-row.live-arrival { animation: none; }
+}
 
 @media (max-width: 920px) {
   .room-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }

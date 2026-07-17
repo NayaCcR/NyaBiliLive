@@ -1,4 +1,4 @@
-const adminState = { user: null, mustChangePassword: false, rooms: [], config: null, monitor: null, managementEnabled: false, view: "overview" };
+const adminState = { user: null, mustChangePassword: false, rooms: [], config: null, monitor: null, managementEnabled: false, view: "overview", refreshTimer: null, refreshInFlight: false };
 const root = document.querySelector("#admin-root");
 const escapeHtml = (value = "") => String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;");
 const count = (value) => new Intl.NumberFormat("zh-CN").format(Number(value || 0));
@@ -36,6 +36,7 @@ async function boot() {
 }
 
 function showLogin(message = "") {
+  if (adminState.refreshTimer) { clearInterval(adminState.refreshTimer); adminState.refreshTimer = null; }
   root.replaceChildren(document.querySelector("#login-template").content.cloneNode(true));
   const form = document.querySelector("#login-form");
   form.addEventListener("submit", async (event) => {
@@ -56,7 +57,22 @@ async function showConsole() {
 }
 
 async function loadConsoleData() {
-  await Promise.all([loadRooms(), loadConfig(), loadMonitor()]); renderView();
+  await Promise.all([loadRooms(), loadConfig(), loadMonitor()]); renderView(); startAdminRefresh();
+}
+
+function startAdminRefresh() {
+  if (adminState.refreshTimer) clearInterval(adminState.refreshTimer);
+  adminState.refreshTimer = setInterval(async () => {
+    if (document.hidden || adminState.refreshInFlight || document.querySelector(".modal-backdrop")) return;
+    if (!['overview', 'rooms'].includes(adminState.view)) return;
+    adminState.refreshInFlight = true;
+    try {
+      await Promise.all([loadRooms(), loadMonitor()]);
+      if (adminState.view === "overview") renderOverview();
+      if (adminState.view === "rooms") renderRooms();
+    } catch {}
+    finally { adminState.refreshInFlight = false; }
+  }, 4000);
 }
 
 function openForcedPasswordChange() {
