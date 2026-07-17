@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+node_modules/
+.pnpm-store/
+config.json
+data/*.db
+data/*.db-*
+*.log
+.DS_Store

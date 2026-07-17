@@ -1,0 +1,37 @@
+{
+  "app": {
+    "site_name": "NyaBiliLive",
+    "tagline": "还在忙嘛~",
+    "host": "127.0.0.1",
+    "port": 8735,
+    "timezone": "Asia/Shanghai"
+  },
+  "features": {
+    "admin_room_management": true,
+    "public_room_directory": true
+  },
+  "security": {
+    "admin_username": "admin",
+    "admin_password": "nya123nya321",
+    "ingest_token": "replace-with-a-long-random-token",
+    "session_secret": "replace-with-a-long-random-secret",
+    "bilibili_cookie": "",
+    "bilibili_web_refresh_token": "",
+    "bilibili_app_access_key": "",
+    "bilibili_app_refresh_token": "",
+    "bilibili_app_expires_at": ""
+  },
+  "display": {
+    "default_min_messages": 1,
+    "danmaku_page_size": 50,
+    "currency": "CNY"
+  },
+  "monitoring": {
+    "enabled": true,
+    "interval_seconds": 60,
+    "request_timeout_seconds": 10,
+    "auto_update_room_profile": true,
+    "danmaku_enabled": true,
+    "danmaku_reconcile_seconds": 10
+  }
+}

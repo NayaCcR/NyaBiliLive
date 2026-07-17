@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#fcfcfd">
+  <title>NyaBiliLive · 管理</title><link rel="stylesheet" href="/site.css">
+</head>
+<body>
+  <div id="admin-root"><section class="page-loading"><span class="spinner"></span><p>正在验证登录状态…</p></section></div>
+
+  <template id="login-template">
+    <header class="site-header"><div class="toolbar"><a class="wordmark" href="/"><span>N</span><strong>NyaBiliLive</strong></a><nav class="main-nav"><a href="/">房间列表</a><a href="/admin">管理</a></nav><a class="auth-entry active" href="/login">登录</a></div></header>
+    <main class="login-page"><section class="login-card"><div class="login-icon">N</div><div class="login-title"><h1>登录管理后台</h1><p>管理直播间、自动同步与归档配置。</p></div><form id="login-form"><label class="field"><span>管理员账号</span><input name="username" autocomplete="username" required autofocus></label><label class="field"><span>密码</span><input type="password" name="password" autocomplete="current-password" required></label><button class="primary-button" type="submit">登录</button></form></section></main>
+  </template>
+
+  <template id="console-template">
+    <header class="site-header"><div class="toolbar"><a class="wordmark" href="/"><span>N</span><strong>NyaBiliLive</strong></a><nav class="main-nav"><a href="/">房间列表</a><a class="active" href="/admin">管理</a></nav><div class="user-actions"><span id="admin-username"></span><button type="button" id="logout">退出</button></div></div></header>
+    <main class="page-container admin-page">
+      <section class="page-title-row admin-heading"><div><p class="kicker">ADMIN CONSOLE</p><h1 id="view-title">数据概览</h1><p id="view-description" class="page-description"></p></div></section>
+      <nav class="admin-tabs admin-nav" aria-label="管理区域"><button class="active" type="button" data-view="overview">概览</button><button type="button" data-view="rooms">房间管理</button><button type="button" data-view="config">系统配置</button></nav>
+      <div id="admin-content"></div>
+    </main>
+  </template>
+
+  <template id="room-modal-template">
+    <div class="modal-backdrop"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="room-modal-title"><header class="modal-heading"><div><p class="kicker">LIVE ROOM</p><h2 id="room-modal-title">添加直播间</h2></div><button type="button" data-close aria-label="关闭">×</button></header><form id="room-form"><div class="form-grid"><label class="field"><span>房间号</span><input name="room_number" required maxlength="32"></label><label class="field"><span>访问别名</span><input name="alias" maxlength="64" pattern="[a-zA-Z0-9_-]*" placeholder="例如 nya"></label><label class="field"><span>主播名称</span><input name="streamer_name" maxlength="100" placeholder="留空则自动获取"></label><label class="field"><span>头像地址</span><input name="avatar_url" type="url" placeholder="留空则自动获取"></label><label class="field full"><span>房间说明</span><textarea name="description" maxlength="500"></textarea></label><label class="toggle-field full"><span><strong>在前台启用</strong><small>启用后监视器会定期检查直播状态</small></span><span class="toggle"><input name="enabled" type="checkbox" checked><i></i></span></label></div><div class="modal-actions"><button class="secondary-button" type="button" data-close>取消</button><button class="primary-button" type="submit">保存房间</button></div></form></section></div>
+  </template>
+
+  <template id="session-modal-template">
+    <div class="modal-backdrop"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="session-modal-title"><header class="modal-heading"><div><p class="kicker">SESSION</p><h2 id="session-modal-title">创建直播场次</h2></div><button type="button" data-close aria-label="关闭">×</button></header><form id="session-form"><div class="form-grid"><label class="field full"><span>直播标题</span><input name="title" required maxlength="200"></label><label class="field"><span>父分区</span><input name="parent_area"></label><label class="field"><span>分区</span><input name="area"></label><label class="field full"><span>封面地址</span><input name="cover_url" type="url"></label><label class="field"><span>开始时间</span><input name="started_at" type="datetime-local" required></label><label class="field"><span>状态</span><select name="status"><option value="live">直播中</option><option value="ended">已结束</option></select></label><label class="field"><span>峰值人气</span><input name="peak_popularity" type="number" min="0" value="0"></label><label class="field full"><span>场次备注</span><textarea name="note" maxlength="1000"></textarea></label></div><div class="modal-actions"><button class="secondary-button" type="button" data-close>取消</button><button class="primary-button" type="submit">创建场次</button></div></form></section></div>
+  </template>
+
+  <script src="/console.js" defer></script>
+</body>
+</html>

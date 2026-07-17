@@ -1,0 +1,31 @@
+{
+  "name": "nyabililive",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A polished Bilibili live session archive and analytics dashboard.",
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch server/index.js",
+    "start": "node server/index.js",
+    "seed": "node server/cli.js seed",
+    "check": "node --check server/index.js && node --check server/database.js && node --check server/bilibili.js && node --check server/bilibili-auth.js && node --check server/danmaku.js && node --check server/schemas.js && node --check static/public.js && node --check static/console.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.2.0",
+    "blive-message-listener": "0.5.5",
+    "cheerio": "^1.2.0",
+    "cookie-session": "^2.1.1",
+    "express": "^5.1.0",
+    "helmet": "^8.1.0",
+    "morgan": "^1.10.0",
+    "qrcode": "^1.5.4",
+    "zod": "^4.0.5"
+  },
+  "devDependencies": {
+    "supertest": "^7.1.4"
+  }
+}

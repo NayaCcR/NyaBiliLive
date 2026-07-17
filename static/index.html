@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f8f9fb">
+  <title>NyaBiliLive · 直播记录</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="NyaBiliLive 首页">
+        <span class="brand-mark">N</span>
+        <span><strong id="site-name">NyaBiliLive</strong><small>LIVE ARCHIVE</small></span>
+      </a>
+      <div class="topbar-actions">
+        <label class="room-picker-wrap" id="room-picker-wrap" hidden>
+          <span>直播间</span>
+          <select id="room-picker" aria-label="切换直播间"></select>
+        </label>
+        <a class="admin-link" href="/admin">管理后台</a>
+      </div>
+    </header>
+
+    <main id="app" class="content" aria-live="polite">
+      <section class="loading-state">
+        <div class="loading-mark">N</div>
+        <p>正在整理直播记录…</p>
+      </section>
+    </main>
+  </div>
+
+  <template id="room-template">
+    <section class="room-heading">
+      <div class="room-avatar" id="room-avatar"></div>
+      <div class="room-title-wrap">
+        <p class="eyebrow"><span class="status-dot"></span><span id="room-status">直播记录</span></p>
+        <h1 id="room-title"></h1>
+        <p id="room-description" class="room-description"></p>
+      </div>
+      <div class="room-number"><span>ROOM</span><strong id="room-number"></strong></div>
+    </section>
+
+    <section class="session-section">
+      <div class="section-heading">
+        <div><p class="eyebrow">SESSION ARCHIVE</p><h2>场次记录</h2></div>
+        <div class="session-nav" aria-label="场次列表翻页">
+          <button type="button" id="session-prev" class="icon-button" title="向前浏览">‹</button>
+          <button type="button" id="session-next" class="icon-button" title="向后浏览">›</button>
+        </div>
+      </div>
+      <div class="session-strip" id="session-strip"></div>
+    </section>
+
+    <section class="selected-session" id="selected-session">
+      <div class="session-hero" id="session-hero">
+        <div class="cover-art" id="cover-art"><span id="cover-monogram">N</span></div>
+        <div class="session-info">
+          <div class="session-meta"><span id="session-state"></span><span id="session-area"></span><span id="session-date"></span></div>
+          <h2 id="session-title"></h2>
+          <p id="session-note"></p>
+        </div>
+      </div>
+
+      <div class="stats-grid" id="stats-grid"></div>
+
+      <nav class="tabs" aria-label="记录类型">
+        <button type="button" class="tab active" data-tab="gifts">打赏与礼物</button>
+        <button type="button" class="tab" data-tab="danmaku">弹幕历史</button>
+        <button type="button" class="tab" data-tab="viewers">进房用户</button>
+      </nav>
+
+      <div class="tab-panel" id="panel-gifts"></div>
+      <div class="tab-panel" id="panel-danmaku" hidden></div>
+      <div class="tab-panel" id="panel-viewers" hidden></div>
+    </section>
+  </template>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>

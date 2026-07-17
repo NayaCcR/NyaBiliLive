@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#fcfcfd">
+  <title>NyaBiliLive</title>
+  <link rel="stylesheet" href="/site.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="toolbar">
+      <a class="wordmark" href="/" aria-label="NyaBiliLive 首页"><span>N</span><strong>NyaBiliLive</strong></a>
+      <nav class="main-nav" aria-label="主导航"><a class="active" href="/">房间列表</a><a href="/admin">管理</a></nav>
+      <a class="auth-entry" id="auth-entry" href="/login">登录</a>
+    </div>
+  </header>
+
+  <main id="app" class="page-container" aria-live="polite">
+    <section class="page-loading"><span class="spinner"></span><p>正在读取直播间…</p></section>
+  </main>
+
+  <template id="directory-template">
+    <section class="page-title-row">
+      <div><p class="kicker">LIVE ROOMS</p><h1>房间列表</h1><p id="directory-note" class="page-description"></p></div>
+      <span class="count-label" id="room-count"></span>
+    </section>
+    <section class="room-grid" id="room-grid"></section>
+  </template>
+
+  <template id="room-template">
+    <section class="session-page-heading">
+      <div><a class="back-link" href="/">← 返回房间列表</a><p class="kicker">SESSION ARCHIVE</p><h1>场次记录</h1></div>
+      <div class="session-heading-actions"><span class="count-label" id="session-count"></span><button type="button" id="refresh-room" aria-label="刷新场次数据" title="刷新场次数据">↻</button><a id="open-live-room" target="_blank" rel="noopener">打开直播间 ↗</a></div>
+    </section>
+
+    <section class="live-overview" id="live-overview">
+      <div class="overview-collapsed-summary"><span>场次概览</span><strong id="collapsed-session-title"></strong></div>
+      <button class="overview-toggle" id="overview-toggle" type="button" aria-expanded="true" title="折叠场次概览"><span>收起概览</span><b aria-hidden="true">⌃</b></button>
+      <div class="cover-frame" id="cover-art"><div class="cover-fallback"><span>LIVE</span><small>NyaBiliLive</small></div></div>
+      <div class="live-copy">
+        <div class="session-meta"><span id="session-state"></span><span id="session-area"></span><span id="session-date"></span></div>
+        <h2 id="session-title"></h2><p id="session-note"></p>
+        <div class="session-timeline"><span><small>开始时间</small><strong id="session-start"></strong></span><span><small>结束时间</small><strong id="session-end"></strong></span><span><small>直播时长</small><strong id="session-duration"></strong></span></div>
+        <div class="stats-row" id="stats-grid"></div>
+      </div>
+    </section>
+
+    <section class="archive-section">
+      <header class="section-title-row"><div><p class="kicker">SESSION ARCHIVE</p><h2>场次记录</h2></div><div class="archive-controls"><button type="button" id="session-prev" aria-label="向前浏览">←</button><button type="button" id="session-next" aria-label="向后浏览">→</button></div></header>
+      <div class="session-strip" id="session-strip"></div>
+    </section>
+
+    <section class="records-section" id="selected-session">
+      <nav class="record-tabs" aria-label="记录类型"><button type="button" class="tab active" data-tab="gifts">打赏与礼物</button><button type="button" class="tab" data-tab="danmaku">弹幕历史</button><button type="button" class="tab" data-tab="viewers">进房用户</button></nav>
+      <div class="tab-panel" id="panel-gifts"></div><div class="tab-panel" id="panel-danmaku" hidden></div><div class="tab-panel" id="panel-viewers" hidden></div>
+    </section>
+  </template>
+
+  <script src="/public.js" defer></script>
+</body>
+</html>
