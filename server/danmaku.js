@@ -39,6 +39,97 @@ function normalizeMessageUser(message, user = message.body?.user, fallback = mes
   return normalizeUser(user, fallback, messageAvatar(message, user));
 }
 
+function giftName(body = {}, raw = {}) {
+  const candidates = [
+    body.gift_name,
+    body.gift?.gift_name,
+    raw.gift_name,
+    raw.giftName,
+    raw.original_gift_name,
+    raw.batch_combo_send?.gift_name,
+    raw.role_name,
+  ];
+  return String(candidates.find((value) => typeof value === "string" && value.trim()) || "");
+}
+
+function messageGiftIcon(message, body = message.body || {}, raw = message.raw || {}) {
+  const candidates = [
+    body.gift_icon_url,
+    body.gift?.gift_icon_url,
+    body.gift?.gift_img,
+    raw.gift_icon_url,
+    raw.gift_img,
+    raw.gift_img_basic,
+    raw.gift_img_dynamic,
+  ];
+  return String(candidates.find((value) => typeof value === "string" && value.trim()) || "");
+}
+
+function giftCount(body = {}, raw = {}) {
+  const candidates = [
+    body.amount,
+    body.num,
+    raw.num,
+    raw.gift_num,
+    raw.total_num,
+    raw.batch_combo_num,
+    raw.combo_num,
+    raw.batch_combo_send?.gift_num,
+    1,
+  ];
+  return Math.max(1, Number(candidates.find((value) => Number(value) > 0) || 1));
+}
+
+function giftUnitPrice(body = {}, raw = {}) {
+  const count = giftCount(body, raw);
+  const totalCoin = Number(raw.total_coin ?? raw.combo_total_coin ?? body.combo?.total_price ?? 0);
+  const coinType = String(body.coin_type || raw.coin_type || "").toLowerCase();
+  if (totalCoin > 0 && (coinType === "gold" || !coinType)) {
+    return Math.round((totalCoin / 1000 / count) * 100) / 100;
+  }
+  if (body.coin_type === "gold" || raw.coin_type === "gold") {
+    const price = Number(body.price ?? raw.price ?? raw.gift_price ?? 0);
+    return price > 0 ? price / 1000 : 0;
+  }
+  const directPrice = Number(body.price ?? raw.price ?? raw.gift_price ?? 0);
+  return directPrice > 0 && (!body.coin_type && !raw.coin_type) ? directPrice / 1000 : 0;
+}
+
+function giftTimestamp(message, body = message.body || {}, raw = message.raw || {}) {
+  return toIsoTimestamp(
+    body.timestamp
+    || body.time
+    || body.start_time
+    || raw.timestamp
+    || raw.time
+    || raw.start_time
+    || message.timestamp,
+  );
+}
+
+function normalizeGiftUser(message, body = message.body || {}, raw = message.raw || {}, fallback = message.id) {
+  if (body.user) return normalizeMessageUser(message, body.user, fallback);
+  return normalizeUser({
+    uid: raw.uid,
+    uname: raw.uname || raw.username,
+    face: raw.face,
+    identity: { guard_level: raw.guard_level || raw.medal_info?.guard_level || 0 },
+  }, fallback);
+}
+
+function giftTradeId(prefix, message, body = message.body || {}, raw = message.raw || {}) {
+  const key = [
+    raw.payflow_id,
+    raw.combo_id,
+    raw.batch_combo_id,
+    raw.tid,
+    raw.rnd,
+    body.id,
+    message.id,
+  ].find((value) => value !== undefined && value !== null && String(value).trim());
+  return key ? `${prefix}:${key}` : "";
+}
+
 export class DanmakuCollector {
   constructor({ database, config, listenerFactory = startListen, profileFetcher = fetchBilibiliUserProfiles, logger = console } = {}) {
     this.database = database;
@@ -218,6 +309,7 @@ export class DanmakuCollector {
       handshakeTimer: null,
       retryAt: null,
       stopped: false,
+      recentGiftTrades: new Map(),
     };
     this.connections.set(room.id, connection);
     const isCurrent = () => !connection.stopped && this.connections.get(room.id) === connection;
@@ -234,6 +326,16 @@ export class DanmakuCollector {
     const clearHandshakeTimer = () => {
       if (connection.handshakeTimer) clearTimeout(connection.handshakeTimer);
       connection.handshakeTimer = null;
+    };
+    const rememberGiftTrade = (tradeId) => {
+      const now = Date.now();
+      for (const [key, seenAt] of connection.recentGiftTrades) {
+        if (now - seenAt > 10 * 60 * 1000) connection.recentGiftTrades.delete(key);
+      }
+      if (!tradeId) return true;
+      if (connection.recentGiftTrades.has(tradeId)) return false;
+      connection.recentGiftTrades.set(tradeId, now);
+      return true;
     };
     const reportError = (error) => {
       if (!isCurrent()) return;
@@ -287,15 +389,34 @@ export class DanmakuCollector {
       },
       onGift: (message) => {
         const body = message.body;
+        const tradeId = giftTradeId("gift", message, body, message.raw);
+        if (!rememberGiftTrade(tradeId)) return;
+        const resolvedGiftName = giftName(body, message.raw);
+        if (!resolvedGiftName) return;
         ingest({
           type: "gift",
-          timestamp: toIsoTimestamp(message.timestamp),
-          user: normalizeMessageUser(message, body.user),
-          gift_name: body.gift_name,
-          gift_icon_url: "",
-          count: Math.max(1, Number(body.amount || 1)),
-          unit_price: body.coin_type === "gold" ? Number(body.price || 0) / 1000 : 0,
-          trade_id: `gift:${message.id}`,
+          timestamp: giftTimestamp(message, body),
+          user: normalizeGiftUser(message, body, message.raw),
+          gift_name: resolvedGiftName,
+          gift_icon_url: messageGiftIcon(message, body),
+          count: giftCount(body, message.raw),
+          unit_price: giftUnitPrice(body, message.raw),
+          trade_id: tradeId,
+        });
+      },
+      onGuardBuy: (message) => {
+        const body = message.body;
+        const tradeId = giftTradeId("guard", message, body, message.raw);
+        if (!rememberGiftTrade(tradeId)) return;
+        ingest({
+          type: "gift",
+          timestamp: giftTimestamp(message, body),
+          user: normalizeGiftUser(message, body, message.raw),
+          gift_name: giftName(body, message.raw) || "大航海",
+          gift_icon_url: messageGiftIcon(message, body),
+          count: giftCount(body, message.raw),
+          unit_price: giftUnitPrice(body, message.raw),
+          trade_id: tradeId,
         });
       },
       onIncomeSuperChat: (message) => {
@@ -330,6 +451,25 @@ export class DanmakuCollector {
         } catch (error) {
           reportError(error);
         }
+      },
+      raw: {
+        COMBO_SEND: (raw) => {
+          const syntheticMessage = { id: raw.combo_id || raw.batch_combo_id || raw.rnd || "combo", timestamp: raw.timestamp || raw.tid || Date.now(), body: {}, raw };
+          const tradeId = giftTradeId("gift", syntheticMessage, syntheticMessage.body, raw);
+          if (!rememberGiftTrade(tradeId)) return;
+          const resolvedGiftName = giftName({}, raw);
+          if (!resolvedGiftName) return;
+          ingest({
+            type: "gift",
+            timestamp: giftTimestamp(syntheticMessage, syntheticMessage.body, raw),
+            user: normalizeGiftUser(syntheticMessage, syntheticMessage.body, raw, tradeId || syntheticMessage.id),
+            gift_name: resolvedGiftName,
+            gift_icon_url: messageGiftIcon(syntheticMessage, syntheticMessage.body, raw),
+            count: giftCount({}, raw),
+            unit_price: giftUnitPrice({}, raw),
+            trade_id: tradeId,
+          });
+        },
       },
     };
     try {

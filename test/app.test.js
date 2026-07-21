@@ -369,7 +369,35 @@ describe("administration and ingestion", () => {
     rawDanmakuInfo[0] = [];
     rawDanmakuInfo[0][15] = { user: { base: { face: "https://i0.hdslb.com/bfs/face/raw-avatar.jpg" } } };
     connection.handler.onIncomeDanmu({ id: "danmaku-1", timestamp: 1_752_688_101_000, raw: { info: rawDanmakuInfo }, body: { timestamp: 1_752_688_101_000, user, content: "WebSocket 采集成功" } });
-    connection.handler.onGift({ id: "gift-1", timestamp: 1_752_688_102_000, body: { user, gift_name: "小花花", coin_type: "gold", price: 1000, amount: 2 } });
+    connection.handler.onGift({
+      id: "gift-1",
+      timestamp: 1_752_688_102_000,
+      raw: { gift_img: "https://s1.hdslb.com/bfs/live/gift-small-flower.png" },
+      body: { user, gift_name: "小花花", coin_type: "gold", price: 1000, amount: 2 },
+    });
+    connection.handler.onGuardBuy({
+      id: "guard-1",
+      timestamp: 1_752_688_103_000,
+      raw: { payflow_id: "payflow-guard-1" },
+      body: {
+        user: { uid: 667788, uname: "上舰测试观众", face: "https://i0.hdslb.com/bfs/face/guard-avatar.jpg" },
+        gift_name: "舰长",
+        price: 138000,
+      },
+    });
+    connection.handler.raw.COMBO_SEND({
+      combo_id: "combo-small-1",
+      batch_combo_id: "combo-small-batch-1",
+      uid: 556677,
+      uname: "一电池测试观众",
+      face: "https://i0.hdslb.com/bfs/face/combo-avatar.jpg",
+      gift_name: "小心心",
+      gift_img: "https://s1.hdslb.com/bfs/live/gift-heart.png",
+      combo_total_coin: 100,
+      total_num: 1,
+      timestamp: 1_752_688_104_000,
+      coin_type: "gold",
+    });
 
     const danmaku = await request(app).get(`/api/sessions/${session.id}/danmaku?q=${encodeURIComponent("WebSocket 采集成功")}`).expect(200);
     assert.equal(danmaku.body.total, 1);
@@ -382,11 +410,16 @@ describe("administration and ingestion", () => {
     assert.equal(viewers.body.items[0].last_entered_at, new Date(1_752_688_100_000).toISOString());
     const gifts = await request(app).get(`/api/sessions/${session.id}/gifts`).expect(200);
     assert.equal(gifts.body.gifts.find((item) => item.gift_name === "小花花").total_value, 2);
+    assert.equal(gifts.body.gifts.find((item) => item.gift_name === "舰长").total_value, 138);
+    assert.equal(gifts.body.gifts.find((item) => item.gift_name === "小心心").total_value, 0.1);
+    assert.equal(gifts.body.history.find((item) => item.gift_name === "小花花").gift_icon_url, "https://s1.hdslb.com/bfs/live/gift-small-flower.png");
+    assert.equal(gifts.body.history.find((item) => item.gift_name === "舰长").username, "上舰测试观众");
+    assert.equal(gifts.body.history.find((item) => item.gift_name === "小心心").username, "一电池测试观众");
 
     const monitor = await agent.get("/api/admin/monitor").expect(200);
     const status = monitor.body.danmaku.rooms.find((item) => item.room_number === "7788");
     assert.equal(status.status, "listening");
-    assert.equal(status.message_count, 3);
+    assert.equal(status.message_count, 5);
 
     connection.handler.onClose();
     const closedMonitor = await agent.get("/api/admin/monitor").expect(200);
@@ -399,7 +432,7 @@ describe("administration and ingestion", () => {
     const recoveredStatus = recoveredMonitor.body.danmaku.rooms.find((item) => item.room_number === "7788");
     assert.equal(recoveredStatus.status, "listening");
     assert.equal(recoveredStatus.last_error, "");
-    assert.equal(recoveredStatus.message_count, 4);
+    assert.equal(recoveredStatus.message_count, 6);
 
     const missingAvatarUser = { uid: 889900, uname: "等待头像补全", face: "", identity: { guard_level: 0 } };
     profileResponse = [{ uid: "889900", username: "头像已补全", avatar_url: "https://i1.hdslb.com/bfs/face/enriched.jpg" }];
