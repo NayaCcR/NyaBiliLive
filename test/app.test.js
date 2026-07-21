@@ -138,6 +138,7 @@ describe("public archive", () => {
 
   test("serves the room path and seeded archive data", async () => {
     await request(app).get("/naya").expect(200).expect("Content-Type", /html/);
+    await request(app).get("/claim/naya").expect(200).expect("Content-Type", /html/);
     await request(app).get("/config.json").expect(404);
     await request(app).get("/.env").expect(404);
     const room = await request(app).get("/api/rooms/naya").expect(200);
