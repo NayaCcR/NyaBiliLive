@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#fcfcfd">
+  <title>NyaBiliLive · 认领直播间</title>
+  <link rel="stylesheet" href="/site.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="toolbar">
+      <a class="wordmark" href="/" aria-label="NyaBiliLive 首页"><span>N</span><strong>NyaBiliLive</strong></a>
+      <nav class="main-nav" aria-label="主导航"><a href="/">房间列表</a><a href="/admin">管理</a></nav>
+      <a class="auth-entry" id="auth-entry" href="/login">登录</a>
+    </div>
+  </header>
+
+  <main id="app" class="page-container" aria-live="polite">
+    <section class="page-loading"><span class="spinner"></span><p>正在读取认领页面…</p></section>
+  </main>
+
+  <script src="/claim.js" defer></script>
+</body>
+</html>

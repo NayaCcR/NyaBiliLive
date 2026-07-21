@@ -17,9 +17,11 @@ import {
   ingestEventSchema,
   loginSchema,
   roomCreateSchema,
+  roomClaimManagersUpdateSchema,
   roomUpdateSchema,
   sessionCreateSchema,
   sessionUpdateSchema,
+  viewerNoteUpdateSchema,
 } from "./schemas.js";
 
 const rootDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -29,6 +31,10 @@ const staticDirectory = path.join(rootDirectory, "static");
 const environment = typeof process === "undefined" ? {} : process.env;
 const argumentsList = typeof process === "undefined" ? [] : process.argv;
 const DEFAULT_ADMIN_PASSWORD = "nya123nya321";
+const CLAIM_CODE_PREFIX = "Nya-bl";
+const CLAIM_CHALLENGE_TTL = 15 * 60 * 1000;
+const CLAIM_COOKIE_NAME = "nyabililive_room_claims";
+const CLAIM_COOKIE_MAX_AGE = 180 * 24 * 60 * 60 * 1000;
 const SAFE_HTTP_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
 const httpError = (status, message) => Object.assign(new Error(message), { status });
@@ -49,6 +55,40 @@ const safeEqual = (first, second) => crypto.timingSafeEqual(
 const isInsideDirectory = (parent, candidate) => {
   const relative = path.relative(parent, candidate);
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+};
+const parseCookieHeader = (header = "") => Object.fromEntries(String(header).split(/;\s*/).filter(Boolean).map((entry) => {
+  const index = entry.indexOf("=");
+  return index >= 0 ? [entry.slice(0, index), entry.slice(index + 1)] : [entry, ""];
+}));
+const serializeCookie = (name, value, {
+  path: cookiePath = "/",
+  maxAge = null,
+  httpOnly = true,
+  sameSite = "Strict",
+  secure = false,
+} = {}) => [
+  `${name}=${value}`,
+  `Path=${cookiePath}`,
+  Number.isFinite(maxAge) ? `Max-Age=${Math.max(0, Math.floor(maxAge / 1000))}` : "",
+  httpOnly ? "HttpOnly" : "",
+  sameSite ? `SameSite=${sameSite}` : "",
+  secure ? "Secure" : "",
+].filter(Boolean).join("; ");
+const encodeSignedJson = (payload, secret) => {
+  const body = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+  const signature = crypto.createHmac("sha256", secret).update(body).digest("base64url");
+  return `${body}.${signature}`;
+};
+const decodeSignedJson = (value, secret) => {
+  if (!value || !String(value).includes(".")) return null;
+  const [body, signature] = String(value).split(".", 2);
+  const expected = crypto.createHmac("sha256", secret).update(body).digest("base64url");
+  if (!safeEqual(signature, expected)) return null;
+  try {
+    return JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
+  } catch {
+    return null;
+  }
 };
 const requestMatchesOrigin = (request) => {
   const fetchSite = String(request.get("Sec-Fetch-Site") || "").toLowerCase();
@@ -173,6 +213,54 @@ export function createApp({
       next(error);
     }
   });
+  app.use((request, _response, next) => {
+    const parsed = decodeSignedJson(
+      parseCookieHeader(request.get("cookie"))[CLAIM_COOKIE_NAME],
+      config.value.security.session_secret,
+    );
+    request.roomClaims = parsed?.claims && typeof parsed.claims === "object" ? parsed.claims : {};
+    next();
+  });
+
+  const claimedRooms = (request) => Object.entries(request.roomClaims || {}).map(([roomId, claim]) => ({
+    room_id: Number(roomId),
+    ...claim,
+  }));
+  const claimRecordForRoom = (request, roomId) => request.roomClaims?.[String(roomId)] || null;
+  const setRoomClaimsCookie = (request, response, claims) => {
+    if (!claims || !Object.keys(claims).length) {
+      response.append("Set-Cookie", serializeCookie(CLAIM_COOKIE_NAME, "", {
+        maxAge: 0,
+        secure: request.secure,
+      }));
+      return;
+    }
+    response.append("Set-Cookie", serializeCookie(
+      CLAIM_COOKIE_NAME,
+      encodeSignedJson({ claims }, config.value.security.session_secret),
+      { maxAge: CLAIM_COOKIE_MAX_AGE, secure: request.secure },
+    ));
+  };
+  const pruneClaimChallenges = (session) => {
+    const entries = Object.entries(session?.claim_challenges || {}).filter(([, challenge]) => (
+      challenge?.issued_at && (Date.now() - new Date(challenge.issued_at).getTime()) < CLAIM_CHALLENGE_TTL
+    ));
+    return Object.fromEntries(entries.slice(-12));
+  };
+  const updateSessionData = (request, updater) => {
+    const current = request.session || {};
+    const nextValue = updater({ ...current });
+    request.session = nextValue && Object.keys(nextValue).length ? nextValue : null;
+  };
+  const isRoomClaimed = (request, roomId) => Boolean(claimRecordForRoom(request, roomId));
+  const roomAccessMode = (request, roomId) => (isAdminSession(request) ? "admin" : (isRoomClaimed(request, roomId) ? "claim" : "guest"));
+  const canAccessRoomProtectedData = (request, roomId) => roomAccessMode(request, roomId) !== "guest";
+  const requireRoomClaimOrAdmin = (request, response, next) => {
+    if (isAdminSession(request)) return next();
+    const roomId = Number(request.params.id);
+    if (!roomId || !isRoomClaimed(request, roomId)) return next(httpError(401, "请先登录管理后台或认领这个直播间"));
+    return next();
+  };
 
   const requireAdmin = (request, _response, next) => {
     if (request.session?.username !== config.value.security.admin_username) {
@@ -180,6 +268,7 @@ export function createApp({
     }
     return next();
   };
+  const isAdminSession = (request) => request.session?.username === config.value.security.admin_username;
   const requireChangedAdminPassword = (request, response, next) => {
     requireAdmin(request, response, (error) => {
       if (error) return next(error);
@@ -243,6 +332,95 @@ export function createApp({
     return response.json({ ...room, sessions: database.listSessions(room.id) });
   });
 
+  app.get("/api/rooms/:identifier/claim", (request, response, next) => {
+    const room = database.getRoom(request.params.identifier);
+    if (!room) return next(httpError(404, "没有找到这个直播间"));
+    const activeSession = database.getActiveSessionForRoom(room.id);
+    const claim = claimRecordForRoom(request, room.id);
+    const managers = database.listRoomClaimManagers(room.id);
+    return response.json({
+      room_id: room.id,
+      room_number: room.room_number,
+      alias: room.alias || "",
+      streamer_name: room.streamer_name,
+      avatar_url: room.avatar_url,
+      current_title: room.room_title || "",
+      bili_uid: room.bili_uid ? String(room.bili_uid) : "",
+      live_status: Number(room.live_status || 0),
+      claim_prefix: `${CLAIM_CODE_PREFIX}${room.claim_key}-`,
+      active_session_id: activeSession?.id || null,
+      claim_manager_count: managers.length,
+      claimed: Boolean(claim),
+      claim: claim || null,
+    });
+  });
+
+  app.post("/api/rooms/:identifier/claim/challenge", (request, response, next) => {
+    const room = database.getRoom(request.params.identifier);
+    if (!room) return next(httpError(404, "没有找到这个直播间"));
+    const managers = database.listRoomClaimManagers(room.id);
+    if (!managers.length) return next(httpError(409, "这个直播间还没有配置认领管理者 UID"));
+    if (Number(room.live_status || 0) !== 1 || !database.getActiveSessionForRoom(room.id)) {
+      return next(httpError(409, "当前未开播，暂时无法通过弹幕认领"));
+    }
+    const challenge = crypto.randomBytes(6).toString("base64").toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 6).padEnd(6, "0");
+    const issuedAt = new Date().toISOString();
+    const code = `${CLAIM_CODE_PREFIX}${room.claim_key}-${challenge}`;
+    updateSessionData(request, (session) => ({
+      ...session,
+      claim_challenges: {
+        ...pruneClaimChallenges(session),
+        [String(room.id)]: {
+          room_id: room.id,
+          room_claim_key: room.claim_key,
+          code,
+          issued_at: issuedAt,
+        },
+      },
+    }));
+    return response.json({
+      code,
+      issued_at: issuedAt,
+      expires_at: new Date(Date.now() + CLAIM_CHALLENGE_TTL).toISOString(),
+    });
+  });
+
+  app.post("/api/rooms/:identifier/claim/verify", (request, response, next) => {
+    const room = database.getRoom(request.params.identifier);
+    if (!room) return next(httpError(404, "没有找到这个直播间"));
+    const managers = database.listRoomClaimManagers(room.id);
+    if (!managers.length) return next(httpError(409, "这个直播间还没有配置认领管理者 UID"));
+    if (Number(room.live_status || 0) !== 1 || !database.getActiveSessionForRoom(room.id)) {
+      return next(httpError(409, "当前未开播，暂时无法通过弹幕认领"));
+    }
+    const challenges = pruneClaimChallenges(request.session || {});
+    const challenge = challenges[String(room.id)];
+    if (!challenge || challenge.room_claim_key !== room.claim_key || !challenge.code?.startsWith(`${CLAIM_CODE_PREFIX}${room.claim_key}-`)) {
+      return next(httpError(409, "认领码已失效，请重新生成"));
+    }
+    const matched = database.findActiveClaimDanmaku(room.id, challenge.code);
+    if (!matched) {
+      return next(httpError(404, "还没有在当前直播弹幕中找到来自已配置管理者 UID 的认领码"));
+    }
+    const claim = {
+      uid: String(matched.bili_uid),
+      username: matched.username,
+      claimed_at: new Date().toISOString(),
+      matched_at: matched.sent_at,
+      room_number: room.room_number,
+      alias: room.alias || "",
+    };
+    const claims = { ...(request.roomClaims || {}), [String(room.id)]: claim };
+    request.roomClaims = claims;
+    setRoomClaimsCookie(request, response, claims);
+    delete challenges[String(room.id)];
+    updateSessionData(request, (session) => ({
+      ...session,
+      claim_challenges: challenges,
+    }));
+    return response.json({ ok: true, claim });
+  });
+
   app.get("/api/sessions/:id/summary", (request, response, next) => {
     const result = database.sessionSummary(Number(request.params.id));
     if (!result) return next(httpError(404, "场次不存在"));
@@ -253,13 +431,21 @@ export function createApp({
     const limit = parsePositiveInt(request.query.limit, config.value.display.danmaku_page_size, 200);
     const offset = parsePositiveInt(request.query.offset, 0);
     const order = parseOption(request.query.order, ["asc", "desc"], "desc", "排序方向");
+    const session = database.getSession(Number(request.params.id));
     response.json(database.listDanmaku(Number(request.params.id), {
-      query: String(request.query.q || "").trim(), limit, offset, order,
+      query: String(request.query.q || "").trim(),
+      limit,
+      offset,
+      order,
+      includeNotes: canAccessRoomProtectedData(request, session?.room_id),
     }));
   });
 
   app.get("/api/sessions/:id/gifts", (request, response) => {
-    response.json(database.giftReport(Number(request.params.id)));
+    const session = database.getSession(Number(request.params.id));
+    response.json(database.giftReport(Number(request.params.id), {
+      includeNotes: canAccessRoomProtectedData(request, session?.room_id),
+    }));
   });
 
   app.get("/api/sessions/:id/viewers", (request, response) => {
@@ -267,6 +453,7 @@ export function createApp({
     const offset = parsePositiveInt(request.query.offset, 0);
     const sortBy = parseOption(request.query.sort, ["first_entered_at", "last_entered_at"], "last_entered_at", "排序字段");
     const order = parseOption(request.query.order, ["asc", "desc"], "desc", "排序方向");
+    const session = database.getSession(Number(request.params.id));
     response.json(database.listViewers(Number(request.params.id), {
       minMessages: parsePositiveInt(request.query.min_messages, 0),
       query: String(request.query.q || "").trim(),
@@ -274,6 +461,7 @@ export function createApp({
       offset,
       sortBy,
       order,
+      includeNotes: canAccessRoomProtectedData(request, session?.room_id),
     }));
   });
 
@@ -284,7 +472,7 @@ export function createApp({
       || !safeEqual(credentials.password, security.admin_password)) {
       return next(httpError(401, "用户名或密码不正确"));
     }
-    request.session = { username: security.admin_username };
+    updateSessionData(request, (session) => ({ ...session, username: security.admin_username }));
     return response.json({
       username: security.admin_username,
       must_change_password: safeEqual(security.admin_password, DEFAULT_ADMIN_PASSWORD),
@@ -292,17 +480,24 @@ export function createApp({
   });
 
   app.post("/api/auth/logout", (request, response) => {
-    request.session = null;
+    updateSessionData(request, (session) => {
+      delete session.username;
+      return session;
+    });
     response.json({ ok: true });
   });
 
   app.get("/api/auth/me", (request, response) => {
     const username = request.session?.username;
-    const authenticated = username === config.value.security.admin_username;
+    const adminAuthenticated = isAdminSession(request);
+    const roomClaims = claimedRooms(request);
+    const authenticated = adminAuthenticated || roomClaims.length > 0;
     response.json({
       authenticated,
-      username: authenticated ? username : null,
-      must_change_password: authenticated && safeEqual(config.value.security.admin_password, DEFAULT_ADMIN_PASSWORD),
+      auth_mode: adminAuthenticated ? "admin" : (roomClaims.length ? "claim" : "guest"),
+      username: adminAuthenticated ? username : (roomClaims[0]?.username || null),
+      must_change_password: adminAuthenticated && safeEqual(config.value.security.admin_password, DEFAULT_ADMIN_PASSWORD),
+      room_claims: roomClaims,
     });
   });
 
@@ -322,7 +517,7 @@ export function createApp({
       ...config.value,
       security: { ...security, admin_password: passwords.new_password },
     });
-    request.session = { username: security.admin_username };
+    updateSessionData(request, (session) => ({ ...session, username: security.admin_username }));
     return response.json({ username: security.admin_username, must_change_password: false });
   });
 
@@ -411,6 +606,16 @@ export function createApp({
     response.json({ ok: true, danmaku: danmakuCollector.status() });
   });
 
+  app.put("/api/rooms/:id/viewer-notes/:uid", requireRoomClaimOrAdmin, (request, response, next) => {
+    const saved = database.saveRoomUserNote(
+      Number(request.params.id),
+      String(request.params.uid),
+      viewerNoteUpdateSchema.parse(request.body).note,
+    );
+    if (!saved) return next(httpError(404, "房间或用户不存在"));
+    return response.json(saved);
+  });
+
   app.get("/api/admin/rooms", requireAdmin, (_request, response) => {
     response.json({
       items: database.listRooms(),
@@ -433,6 +638,34 @@ export function createApp({
     if (!result) return next(httpError(404, "房间不存在"));
     return response.json(result);
   });
+
+  const getRoomClaimManagers = (request, response, next) => {
+    const room = database.getRoomById(Number(request.params.id));
+    if (!room) return next(httpError(404, "房间不存在"));
+    const items = database.listRoomClaimManagers(room.id);
+    return response.json({
+      room_id: room.id,
+      room_number: room.room_number,
+      alias: room.alias || "",
+      streamer_name: room.streamer_name,
+      bili_uid: room.bili_uid ? String(room.bili_uid) : "",
+      items,
+    });
+  };
+
+  const updateRoomClaimManagers = (request, response, next) => {
+    const room = database.getRoomById(Number(request.params.id));
+    if (!room) return next(httpError(404, "房间不存在"));
+    const items = database.replaceRoomClaimManagers(room.id, roomClaimManagersUpdateSchema.parse(request.body).uids);
+    return response.json({
+      room_id: room.id,
+      items,
+      enforced_uid: room.bili_uid ? String(room.bili_uid) : "",
+    });
+  };
+
+  app.get(["/api/admin/rooms/:id/claim-managers", "/api/admin/rooms/:id/managers"], requireAdmin, getRoomClaimManagers);
+  app.put(["/api/admin/rooms/:id/claim-managers", "/api/admin/rooms/:id/managers"], requireRoomManagement, updateRoomClaimManagers);
 
   app.post("/api/admin/rooms/:id/reorder", requireRoomManagement, (request, response, next) => {
     const direction = parseOption(request.body?.direction, ["up", "down"], "", "移动方向");
@@ -476,6 +709,7 @@ export function createApp({
   app.all(["/config.json", "/.env"], (_request, _response, next) => next(httpError(404, "页面不存在")));
   app.use(express.static(staticDirectory, { index: false, maxAge: 0 }));
   app.get(["/admin", "/login"], (_request, response) => response.sendFile(path.join(staticDirectory, "console.html")));
+  app.get("/claim/:identifier", (_request, response) => response.sendFile(path.join(staticDirectory, "claim.html")));
   app.get(["/", "/:identifier"], (_request, response) => response.sendFile(path.join(staticDirectory, "public.html")));
   app.use((_request, _response, next) => next(httpError(404, "页面不存在")));
 

@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import DatabaseDriver from "better-sqlite3";
@@ -23,6 +24,7 @@ CREATE TABLE IF NOT EXISTS rooms (
   room_cover_url TEXT NOT NULL DEFAULT '',
   room_area TEXT NOT NULL DEFAULT '',
   room_parent_area TEXT NOT NULL DEFAULT '',
+  claim_key TEXT NOT NULL DEFAULT '',
   attention INTEGER NOT NULL DEFAULT 0,
   online INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
@@ -86,13 +88,37 @@ CREATE TABLE IF NOT EXISTS gifts (
   trade_id TEXT UNIQUE
 );
 
+CREATE TABLE IF NOT EXISTS room_user_notes (
+  room_id INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  note TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (room_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS room_claim_managers (
+  room_id INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+  bili_uid TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (room_id, bili_uid)
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_room_started ON live_sessions(room_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_danmaku_session_sent ON danmaku(session_id, sent_at DESC);
 CREATE INDEX IF NOT EXISTS idx_gifts_session_received ON gifts(session_id, received_at DESC);
 CREATE INDEX IF NOT EXISTS idx_session_users_messages ON session_users(session_id, message_count DESC);
+CREATE INDEX IF NOT EXISTS idx_room_user_notes_updated ON room_user_notes(room_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_room_claim_managers_uid ON room_claim_managers(bili_uid);
 `;
 
 const now = () => new Date().toISOString();
+const randomBase36 = (length) => crypto.randomBytes(length * 2).toString("base64")
+  .toLowerCase()
+  .replace(/[^a-z0-9]/g, "")
+  .slice(0, length)
+  .padEnd(length, "0");
+const normalizeUid = (value) => String(value || "").trim();
+const uniqueUids = (values) => [...new Set(values.map(normalizeUid).filter(Boolean))];
 
 export class ArchiveDatabase {
   constructor(filePath, { seed = true } = {}) {
@@ -122,6 +148,7 @@ export class ArchiveDatabase {
       ["room_cover_url", "TEXT NOT NULL DEFAULT ''"],
       ["room_area", "TEXT NOT NULL DEFAULT ''"],
       ["room_parent_area", "TEXT NOT NULL DEFAULT ''"],
+      ["claim_key", "TEXT NOT NULL DEFAULT ''"],
       ["attention", "INTEGER NOT NULL DEFAULT 0"],
       ["online", "INTEGER NOT NULL DEFAULT 0"],
       ["sort_order", "INTEGER NOT NULL DEFAULT 0"],
@@ -129,15 +156,38 @@ export class ArchiveDatabase {
     for (const [name, definition] of additions) {
       if (!roomColumns.has(name)) this.db.exec(`ALTER TABLE rooms ADD COLUMN ${name} ${definition}`);
     }
+    const keyInUse = this.db.prepare("SELECT 1 FROM rooms WHERE claim_key = ? AND id != ?").pluck();
+    const updateClaimKey = this.db.prepare("UPDATE rooms SET claim_key = ?, updated_at = ? WHERE id = ?");
+    for (const row of this.db.prepare("SELECT id FROM rooms WHERE claim_key = '' OR claim_key IS NULL").all()) {
+      let claimKey = "";
+      do { claimKey = randomBase36(4); } while (keyInUse.get(claimKey, row.id));
+      updateClaimKey.run(claimKey, now(), row.id);
+    }
+    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_rooms_claim_key ON rooms(claim_key)");
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS room_claim_managers (
+        room_id INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+        bili_uid TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (room_id, bili_uid)
+      )
+    `);
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_room_claim_managers_uid ON room_claim_managers(bili_uid)");
+    this.db.prepare(`
+      INSERT OR IGNORE INTO room_claim_managers (room_id, bili_uid, created_at)
+      SELECT id, bili_uid, ? FROM rooms
+      WHERE bili_uid IS NOT NULL AND bili_uid != ''
+    `).run(now());
   }
 
   prepare() {
     this.statements = {
       roomByIdentifier: this.db.prepare("SELECT * FROM rooms WHERE (room_number = ? OR alias = ?) AND enabled = 1"),
       roomById: this.db.prepare("SELECT * FROM rooms WHERE id = ?"),
+      roomClaimKeyExists: this.db.prepare("SELECT 1 FROM rooms WHERE claim_key = ?").pluck(),
       insertRoom: this.db.prepare(`
-        INSERT INTO rooms (room_number, alias, streamer_name, avatar_url, description, enabled, sort_order, created_at, updated_at)
-        VALUES (@room_number, NULLIF(@alias, ''), @streamer_name, @avatar_url, @description, @enabled, @sort_order, @created_at, @updated_at)
+        INSERT INTO rooms (room_number, alias, streamer_name, avatar_url, description, enabled, sort_order, claim_key, created_at, updated_at)
+        VALUES (@room_number, NULLIF(@alias, ''), @streamer_name, @avatar_url, @description, @enabled, @sort_order, @claim_key, @created_at, @updated_at)
       `),
       deleteRoom: this.db.prepare("DELETE FROM rooms WHERE id = ?"),
       insertSession: this.db.prepare(`
@@ -199,6 +249,36 @@ export class ArchiveDatabase {
           (session_id, user_id, gift_name, gift_icon_url, count, unit_price, total_value, received_at, trade_id)
         VALUES (@session_id, @user_id, @gift_name, @gift_icon_url, @count, @unit_price, @total_value, @timestamp, NULLIF(@trade_id, ''))
       `),
+      upsertRoomUserNote: this.db.prepare(`
+        INSERT INTO room_user_notes (room_id, user_id, note, updated_at)
+        VALUES (@room_id, @user_id, @note, @updated_at)
+        ON CONFLICT(room_id, user_id) DO UPDATE SET
+          note = excluded.note,
+          updated_at = excluded.updated_at
+      `),
+      deleteRoomUserNote: this.db.prepare("DELETE FROM room_user_notes WHERE room_id = ? AND user_id = ?"),
+      listRoomClaimManagers: this.db.prepare(`
+        SELECT room_id, bili_uid, created_at
+        FROM room_claim_managers
+        WHERE room_id = ?
+        ORDER BY CASE WHEN bili_uid = (SELECT bili_uid FROM rooms WHERE id = room_id) THEN 0 ELSE 1 END ASC, created_at ASC, bili_uid ASC
+      `),
+      insertRoomClaimManager: this.db.prepare(`
+        INSERT INTO room_claim_managers (room_id, bili_uid, created_at)
+        VALUES (@room_id, @bili_uid, @created_at)
+        ON CONFLICT(room_id, bili_uid) DO NOTHING
+      `),
+      deleteRoomClaimManagers: this.db.prepare("DELETE FROM room_claim_managers WHERE room_id = ?"),
+      claimDanmakuByRoomManager: this.db.prepare(`
+        SELECT d.id, d.sent_at, d.content, u.bili_uid, u.username
+        FROM danmaku d
+        JOIN users u ON u.id = d.user_id
+        JOIN live_sessions s ON s.id = d.session_id
+        JOIN room_claim_managers m ON m.room_id = s.room_id AND m.bili_uid = u.bili_uid
+        WHERE s.room_id = ? AND s.status = 'live' AND d.content = ?
+        ORDER BY d.sent_at DESC, d.id DESC
+        LIMIT 1
+      `),
     };
 
     this.ingestTransaction = this.db.transaction((event) => {
@@ -244,7 +324,8 @@ export class ArchiveDatabase {
         COALESCE((SELECT NULLIF(parent_area, '') FROM live_sessions recent WHERE recent.room_id = r.id ORDER BY recent.started_at DESC LIMIT 1), r.room_parent_area) AS current_parent_area,
         (SELECT started_at FROM live_sessions recent WHERE recent.room_id = r.id ORDER BY recent.started_at DESC LIMIT 1) AS current_started_at,
         (SELECT ended_at FROM live_sessions recent WHERE recent.room_id = r.id ORDER BY recent.started_at DESC LIMIT 1) AS current_ended_at,
-        (SELECT status FROM live_sessions recent WHERE recent.room_id = r.id ORDER BY recent.started_at DESC LIMIT 1) AS current_session_status
+        (SELECT status FROM live_sessions recent WHERE recent.room_id = r.id ORDER BY recent.started_at DESC LIMIT 1) AS current_session_status,
+        (SELECT COUNT(*) FROM room_claim_managers managers WHERE managers.room_id = r.id) AS claim_manager_count
       FROM rooms r LEFT JOIN live_sessions s ON s.room_id = r.id
       ${enabledOnly ? "WHERE r.enabled = 1" : ""}
       GROUP BY r.id ORDER BY r.sort_order ASC, r.id ASC
@@ -286,11 +367,14 @@ export class ArchiveDatabase {
   createRoom(input) {
     const timestamp = now();
     const nextOrder = this.db.prepare("SELECT COALESCE(MAX(sort_order), -1) + 1 AS value FROM rooms").get().value;
+    let claimKey = "";
+    do { claimKey = randomBase36(4); } while (this.statements.roomClaimKeyExists.get(claimKey));
     const result = this.statements.insertRoom.run({
       ...input,
       streamer_name: input.streamer_name || `直播间 ${input.room_number}`,
       enabled: Number(input.enabled),
       sort_order: nextOrder,
+      claim_key: claimKey,
       created_at: timestamp,
       updated_at: timestamp,
     });
@@ -364,7 +448,7 @@ export class ArchiveDatabase {
     return { ...session, stats };
   }
 
-  listDanmaku(sessionId, { query = "", limit = 50, offset = 0, order = "desc" } = {}) {
+  listDanmaku(sessionId, { query = "", limit = 50, offset = 0, order = "desc", includeNotes = false } = {}) {
     const search = query ? "AND (d.content LIKE @needle OR u.username LIKE @needle OR u.bili_uid LIKE @needle)" : "";
     const params = { sessionId, needle: `%${query}%`, limit, offset };
     const direction = order === "asc" ? "ASC" : "DESC";
@@ -373,21 +457,28 @@ export class ArchiveDatabase {
       WHERE d.session_id = @sessionId ${search}
     `).get(params).count;
     const items = this.db.prepare(`
-      SELECT d.*, u.bili_uid, u.username, u.avatar_url, u.guard_level
-      FROM danmaku d JOIN users u ON u.id = d.user_id
+      SELECT d.*, u.bili_uid, u.username, u.avatar_url, u.guard_level, COALESCE(run.note, '') AS room_note
+      FROM danmaku d
+      JOIN users u ON u.id = d.user_id
+      JOIN live_sessions s ON s.id = d.session_id
+      LEFT JOIN room_user_notes run ON run.room_id = s.room_id AND run.user_id = d.user_id
       WHERE d.session_id = @sessionId ${search}
       ORDER BY d.sent_at ${direction}, d.id ${direction} LIMIT @limit OFFSET @offset
-    `).all(params);
+    `).all(params).map((item) => ({ ...item, room_note: includeNotes ? item.room_note : "" }));
     return { items, total, limit, offset, order };
   }
 
-  giftReport(sessionId) {
+  giftReport(sessionId, { includeNotes = false } = {}) {
     const ranking = this.db.prepare(`
-      SELECT u.bili_uid, u.username, u.avatar_url, u.guard_level,
+      SELECT u.bili_uid, u.username, u.avatar_url, u.guard_level, COALESCE(run.note, '') AS room_note,
         SUM(g.total_value) AS total_value, SUM(g.count) AS gift_count, COUNT(g.id) AS send_count
-      FROM gifts g JOIN users u ON u.id = g.user_id WHERE g.session_id = ?
+      FROM gifts g
+      JOIN users u ON u.id = g.user_id
+      JOIN live_sessions s ON s.id = g.session_id
+      LEFT JOIN room_user_notes run ON run.room_id = s.room_id AND run.user_id = g.user_id
+      WHERE g.session_id = ?
       GROUP BY u.id ORDER BY total_value DESC, gift_count DESC
-    `).all(sessionId);
+    `).all(sessionId).map((item) => ({ ...item, room_note: includeNotes ? item.room_note : "" }));
     const gifts = this.db.prepare(`
       SELECT g.gift_name, g.gift_icon_url, SUM(g.count) AS count,
         SUM(g.total_value) AS total_value, MAX(g.unit_price) AS unit_price
@@ -395,10 +486,13 @@ export class ArchiveDatabase {
       ORDER BY total_value DESC, count DESC
     `).all(sessionId);
     const history = this.db.prepare(`
-      SELECT g.*, u.bili_uid, u.username, u.avatar_url FROM gifts g
-      JOIN users u ON u.id = g.user_id WHERE g.session_id = ?
+      SELECT g.*, u.bili_uid, u.username, u.avatar_url, COALESCE(run.note, '') AS room_note FROM gifts g
+      JOIN users u ON u.id = g.user_id
+      JOIN live_sessions s ON s.id = g.session_id
+      LEFT JOIN room_user_notes run ON run.room_id = s.room_id AND run.user_id = g.user_id
+      WHERE g.session_id = ?
       ORDER BY g.received_at DESC, g.id DESC
-    `).all(sessionId);
+    `).all(sessionId).map((item) => ({ ...item, room_note: includeNotes ? item.room_note : "" }));
     return { ranking, gifts, history, history_total: history.length };
   }
 
@@ -409,6 +503,7 @@ export class ArchiveDatabase {
     offset = 0,
     sortBy = "last_entered_at",
     order = "desc",
+    includeNotes = false,
   } = {}) {
     const search = query ? "AND (u.username LIKE @needle OR u.bili_uid LIKE @needle)" : "";
     const params = { sessionId, minMessages, needle: `%${query}%`, limit, offset };
@@ -419,16 +514,81 @@ export class ArchiveDatabase {
       WHERE su.session_id = @sessionId AND su.message_count >= @minMessages ${search}
     `).get(params).count;
     const items = this.db.prepare(`
-      SELECT su.*, u.bili_uid, u.username, u.avatar_url, u.guard_level
-      FROM session_users su JOIN users u ON u.id = su.user_id
+      SELECT su.*, u.bili_uid, u.username, u.avatar_url, u.guard_level, COALESCE(run.note, '') AS room_note
+      FROM session_users su
+      JOIN users u ON u.id = su.user_id
+      JOIN live_sessions s ON s.id = su.session_id
+      LEFT JOIN room_user_notes run ON run.room_id = s.room_id AND run.user_id = su.user_id
       WHERE su.session_id = @sessionId AND su.message_count >= @minMessages ${search}
       ORDER BY ${sortColumn} ${direction}, su.user_id ${direction} LIMIT @limit OFFSET @offset
-    `).all(params);
+    `).all(params).map((item) => ({ ...item, room_note: includeNotes ? item.room_note : "" }));
     return { items, total, min_messages: minMessages, limit, offset, sort_by: sortBy, order };
+  }
+
+  saveRoomUserNote(roomId, biliUid, note) {
+    const room = this.getRoomById(Number(roomId));
+    if (!room) return null;
+    const user = this.statements.userId.get(String(biliUid));
+    if (!user) return null;
+    const normalizedNote = String(note || "").trim();
+    const updatedAt = now();
+    if (normalizedNote) {
+      this.statements.upsertRoomUserNote.run({
+        room_id: Number(roomId),
+        user_id: user.id,
+        note: normalizedNote,
+        updated_at: updatedAt,
+      });
+    } else {
+      this.statements.deleteRoomUserNote.run(Number(roomId), user.id);
+    }
+    return {
+      room_id: Number(roomId),
+      bili_uid: String(biliUid),
+      note: normalizedNote,
+      updated_at: updatedAt,
+    };
   }
 
   ingest(event) {
     return this.ingestTransaction(event);
+  }
+
+  listRoomClaimManagers(roomId) {
+    return this.statements.listRoomClaimManagers.all(Number(roomId))
+      .map((item) => ({ room_id: Number(item.room_id), bili_uid: String(item.bili_uid), created_at: item.created_at }));
+  }
+
+  ensureRoomClaimManager(roomId, biliUid) {
+    const normalizedUid = normalizeUid(biliUid);
+    if (!normalizedUid) return false;
+    this.statements.insertRoomClaimManager.run({
+      room_id: Number(roomId),
+      bili_uid: normalizedUid,
+      created_at: now(),
+    });
+    return true;
+  }
+
+  replaceRoomClaimManagers(roomId, uids) {
+    const room = this.getRoomById(Number(roomId));
+    if (!room) return null;
+    const nextUids = uniqueUids([room.bili_uid, ...(Array.isArray(uids) ? uids : [])]);
+    const apply = this.db.transaction(() => {
+      this.statements.deleteRoomClaimManagers.run(Number(roomId));
+      const createdAt = now();
+      nextUids.forEach((biliUid) => this.statements.insertRoomClaimManager.run({
+        room_id: Number(roomId),
+        bili_uid: biliUid,
+        created_at: createdAt,
+      }));
+      return this.listRoomClaimManagers(roomId);
+    });
+    return apply();
+  }
+
+  findActiveClaimDanmaku(roomId, claimCode) {
+    return this.statements.claimDanmakuByRoomManager.get(Number(roomId), String(claimCode)) || null;
   }
 
   updateUserProfile({ uid, avatar_url = "" }) {
@@ -493,6 +653,7 @@ export class ArchiveDatabase {
         update_profile: Number(updateProfile),
         timestamp,
       });
+      if (snapshot.bili_uid) this.ensureRoomClaimManager(roomId, snapshot.bili_uid);
 
       const activeSession = this.db.prepare(
         "SELECT * FROM live_sessions WHERE room_id = ? AND status = 'live' ORDER BY started_at DESC LIMIT 1",

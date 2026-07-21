@@ -4,6 +4,10 @@ const escapeHtml = (value = "") => String(value).replaceAll("&", "&amp;").replac
 const count = (value) => new Intl.NumberFormat("zh-CN").format(Number(value || 0));
 const initials = (name = "N") => [...String(name).trim()].slice(0, 2).join("").toUpperCase() || "N";
 const dateTime = (value) => value ? new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(value)) : "尚无记录";
+const normalizeUidList = (value) => [...new Set(String(value || "")
+  .split(/[\s,，、]+/)
+  .map((item) => item.trim())
+  .filter(Boolean))];
 const randomPassword = (length = 24) => {
   const groups = ["abcdefghijkmnopqrstuvwxyz", "ABCDEFGHJKLMNPQRSTUVWXYZ", "23456789", "!@#$%&*-_=+"];
   const alphabet = groups.join("");
@@ -22,7 +26,10 @@ async function api(url, options = {}) {
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
     if (response.status === 401 && !["/api/auth/login", "/api/auth/change-password"].includes(url)) showLogin();
-    throw new Error(payload.error || `请求失败 (${response.status})`);
+    const error = new Error(payload.error || `请求失败 (${response.status})`);
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
   }
   return payload;
 }
@@ -161,7 +168,7 @@ async function restartDanmaku(event) {
 }
 
 function roomRows(rooms, actions = true) {
-  return rooms.map((room, index) => `<article class="admin-room-row" data-room-id="${room.id}"><span class="admin-avatar">${initials(room.streamer_name)}</span><span class="admin-room-copy"><strong>${escapeHtml(room.streamer_name)}</strong><small>/${escapeHtml(room.alias || room.room_number)} · ${count(room.session_count)} 场</small></span><span class="sync-cell"><span class="state-chip ${Number(room.live_status) === 1 ? "live" : ""}">${Number(room.live_status) === 1 ? "直播中" : "未开播"}</span><small class="${room.last_sync_error ? "error-text" : ""}">${room.last_sync_error ? escapeHtml(room.last_sync_error) : `${dateTime(room.last_sync_at)} 同步`}</small></span>${actions ? `<span class="row-actions"><button data-action="up" title="上移房间" ${index === 0 ? "disabled" : ""}>↑</button><button data-action="down" title="下移房间" ${index === rooms.length - 1 ? "disabled" : ""}>↓</button><button data-action="sync" title="立即同步">↻</button><button data-action="session" title="手动创建场次">＋</button><button data-action="edit" title="编辑房间">✎</button><button data-action="delete" title="删除房间">×</button></span>` : `<a class="room-open-link" href="/${encodeURIComponent(room.alias || room.room_number)}">查看</a>`}</article>`).join("") || '<div class="empty-inline">还没有直播间</div>';
+  return rooms.map((room, index) => `<article class="admin-room-row" data-room-id="${room.id}"><span class="admin-avatar">${initials(room.streamer_name)}</span><span class="admin-room-copy"><strong>${escapeHtml(room.streamer_name)}</strong><small>/${escapeHtml(room.alias || room.room_number)} · ${count(room.session_count)} 场 · ${count(room.claim_manager_count)} 位管理者</small></span><span class="sync-cell"><span class="state-chip ${Number(room.live_status) === 1 ? "live" : ""}">${Number(room.live_status) === 1 ? "直播中" : "未开播"}</span><small class="${room.last_sync_error ? "error-text" : ""}">${room.last_sync_error ? escapeHtml(room.last_sync_error) : `${dateTime(room.last_sync_at)} 同步`}</small></span>${actions ? `<span class="row-actions"><button data-action="up" title="上移房间" ${index === 0 ? "disabled" : ""}>↑</button><button data-action="down" title="下移房间" ${index === rooms.length - 1 ? "disabled" : ""}>↓</button><button data-action="sync" title="立即同步">↻</button><button data-action="session" title="手动创建场次">＋</button><button data-action="edit" title="编辑房间">✎</button><button data-action="managers" title="认领管理者">👥</button><button data-action="delete" title="删除房间">×</button></span>` : `<a class="room-open-link" href="/${encodeURIComponent(room.alias || room.room_number)}">查看</a>`}</article>`).join("") || '<div class="empty-inline">还没有直播间</div>';
 }
 
 function renderRooms() {
@@ -177,6 +184,7 @@ function renderRooms() {
     if (button.dataset.action === "sync") button.addEventListener("click", () => syncRoom(room, button));
     if (button.dataset.action === "session") button.addEventListener("click", () => openSessionModal(room));
     if (button.dataset.action === "edit") { button.disabled = !adminState.managementEnabled; button.addEventListener("click", () => openRoomModal(room)); }
+    if (button.dataset.action === "managers") { button.disabled = !adminState.managementEnabled; button.addEventListener("click", () => openClaimManagersModal(room)); }
     if (button.dataset.action === "delete") { button.disabled = !adminState.managementEnabled; button.addEventListener("click", () => deleteRoom(room)); }
   });
 }
@@ -208,6 +216,52 @@ function openSessionModal(room) {
   const modal = document.querySelector(".modal-backdrop:last-of-type"); const form = modal.querySelector("#session-form"); modal.querySelector("#session-modal-title").textContent = `为 ${room.streamer_name} 创建场次`;
   form.elements.started_at.value = new Date(Date.now() - new Date().getTimezoneOffset() * 60_000).toISOString().slice(0, 16); bindModal(modal);
   form.addEventListener("submit", async (event) => { event.preventDefault(); const data = Object.fromEntries(new FormData(form)); data.started_at = new Date(data.started_at).toISOString(); data.peak_popularity = Number(data.peak_popularity || 0); try { await api(`/api/admin/rooms/${room.id}/sessions`, { method: "POST", body: JSON.stringify(data) }); modal.remove(); await loadRooms(); renderRooms(); toast("场次已创建"); } catch (error) { toast(error.message, "error"); } });
+}
+
+async function openClaimManagersModal(room) {
+  try {
+    const managerApi = async (options = {}) => {
+      try {
+        return await api(`/api/admin/rooms/${room.id}/claim-managers`, options);
+      } catch (error) {
+        if (error.status === 404 && /API 路由不存在/.test(error.message)) {
+          return api(`/api/admin/rooms/${room.id}/managers`, options);
+        }
+        throw error;
+      }
+    };
+    const details = await managerApi();
+    document.body.append(document.querySelector("#claim-managers-modal-template").content.cloneNode(true));
+    const modal = document.querySelector(".modal-backdrop:last-of-type");
+    const form = modal.querySelector("#claim-managers-form");
+    modal.querySelector("#claim-managers-modal-title").textContent = `${details.streamer_name} · 认领管理者`;
+    form.elements.uids.value = details.items.map((item) => item.bili_uid).join("\n");
+    modal.querySelector("#claim-managers-note").textContent = details.bili_uid
+      ? `主播 UID ${details.bili_uid} 会自动保留在列表中。追加规则：只填数字 UID；可以一行一个，也可以写成 uid,uid,uid（逗号、中文逗号、空格都可以）。`
+      : "当前还没同步到主播 UID；你可以先手动填入允许认领的数字 UID，格式支持一行一个或 uid,uid,uid。";
+    bindModal(modal);
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const button = form.querySelector("button[type=submit]");
+      button.disabled = true;
+      try {
+        const uids = normalizeUidList(form.elements.uids.value);
+        await managerApi({
+          method: "PUT",
+          body: JSON.stringify({ uids }),
+        });
+        modal.remove();
+        await loadRooms();
+        renderRooms();
+        toast("认领管理者已保存");
+      } catch (error) {
+        toast(error.message, "error");
+        button.disabled = false;
+      }
+    });
+  } catch (error) {
+    toast(/API 路由不存在/.test(error.message) ? "管理者接口暂不可用，请确认后端已更新并重启" : error.message, "error");
+  }
 }
 
 function bindModal(modal) { modal.querySelectorAll("[data-close]").forEach((button) => button.addEventListener("click", () => modal.remove())); modal.addEventListener("click", (event) => { if (event.target === modal) modal.remove(); }); }

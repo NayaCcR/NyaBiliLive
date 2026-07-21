@@ -202,6 +202,64 @@ describe("public archive", () => {
     assert.ok(recentDescending.body.items.every((item, index, items) => index === 0 || items[index - 1].last_entered_at >= item.last_entered_at));
   });
 
+  test("stores room-specific viewer notes and hides them from anonymous viewers", async () => {
+    await loginAdmin();
+    const room = await request(app).get("/api/rooms/naya").expect(200);
+    const sessionId = room.body.sessions[0].id;
+    const targetViewer = (await request(app).get(`/api/sessions/${sessionId}/viewers?min_messages=0&limit=1`).expect(200)).body.items[0];
+    const targetDanmaku = (await request(app).get(`/api/sessions/${sessionId}/danmaku?limit=1`).expect(200)).body.items[0];
+    const targetGift = (await request(app).get(`/api/sessions/${sessionId}/gifts`).expect(200)).body.history[0];
+
+    await request(app)
+      .put(`/api/rooms/${room.body.id}/viewer-notes/${encodeURIComponent(targetViewer.bili_uid)}`)
+      .send({ note: "熟客" })
+      .expect(401);
+
+    const saved = await agent
+      .put(`/api/rooms/${room.body.id}/viewer-notes/${encodeURIComponent(targetViewer.bili_uid)}`)
+      .send({ note: "熟客" })
+      .expect(200);
+    assert.equal(saved.body.note, "熟客");
+
+    const anonymous = await request(app).get(`/api/sessions/${sessionId}/viewers?min_messages=0&limit=1`).expect(200);
+    assert.equal(anonymous.body.items[0].room_note, "");
+
+    const authenticated = await agent.get(`/api/sessions/${sessionId}/viewers?min_messages=0&limit=1`).expect(200);
+    assert.equal(authenticated.body.items[0].room_note, "熟客");
+
+    await agent
+      .put(`/api/rooms/${room.body.id}/viewer-notes/${encodeURIComponent(targetDanmaku.bili_uid)}`)
+      .send({ note: "弹幕备注" })
+      .expect(200);
+
+    const anonymousDanmaku = await request(app).get(`/api/sessions/${sessionId}/danmaku?limit=1`).expect(200);
+    assert.equal(anonymousDanmaku.body.items[0].room_note, "");
+
+    const authenticatedDanmaku = await agent.get(`/api/sessions/${sessionId}/danmaku?limit=1`).expect(200);
+    assert.equal(authenticatedDanmaku.body.items[0].room_note, "弹幕备注");
+
+    await agent
+      .put(`/api/rooms/${room.body.id}/viewer-notes/${encodeURIComponent(targetGift.bili_uid)}`)
+      .send({ note: "礼物备注" })
+      .expect(200);
+
+    const anonymousGifts = await request(app).get(`/api/sessions/${sessionId}/gifts`).expect(200);
+    assert.ok(anonymousGifts.body.ranking.every((item) => item.room_note === ""));
+    assert.ok(anonymousGifts.body.history.every((item) => item.room_note === ""));
+
+    const authenticatedGifts = await agent.get(`/api/sessions/${sessionId}/gifts`).expect(200);
+    assert.ok(authenticatedGifts.body.ranking.some((item) => item.room_note === "礼物备注"));
+    assert.ok(authenticatedGifts.body.history.some((item) => item.room_note === "礼物备注"));
+
+    await agent
+      .put(`/api/rooms/${room.body.id}/viewer-notes/${encodeURIComponent(targetViewer.bili_uid)}`)
+      .send({ note: "" })
+      .expect(200);
+
+    const cleared = await agent.get(`/api/sessions/${sessionId}/viewers?min_messages=0&limit=1`).expect(200);
+    assert.equal(cleared.body.items[0].room_note, "");
+  });
+
   test("orders danmaku and returns the complete gift history", async () => {
     const room = await request(app).get("/api/rooms/naya").expect(200);
     const sessionId = room.body.sessions[0].id;
@@ -214,6 +272,93 @@ describe("public archive", () => {
     assert.equal(gifts.body.history.length, gifts.body.history_total);
     assert.ok(gifts.body.history.every((item) => item.username && item.gift_name));
     assert.ok(gifts.body.history.every((item, index, items) => index === 0 || items[index - 1].received_at >= item.received_at));
+  });
+
+  test("claims a live room only through configured manager UID danmaku and persists it in cookies", async () => {
+    bilibiliSnapshot = {
+      bili_uid: "24680",
+      streamer_name: "认领测试主播",
+      avatar_url: "",
+      live_status: 1,
+      title: "认领测试场次",
+      cover_url: "",
+      area: "聊天电台",
+      parent_area: "娱乐",
+      live_time: "2026-07-21T12:00:00.000Z",
+      attention: 2048,
+      online: 512,
+    };
+    await loginAdmin();
+    await agent.post("/api/admin/rooms").send({
+      room_number: "246801",
+      alias: "claim-test",
+      streamer_name: "",
+      avatar_url: "",
+      description: "",
+      enabled: true,
+    }).expect(201);
+
+    const room = await request(app).get("/api/rooms/claim-test").expect(200);
+    const session = room.body.sessions.find((item) => item.status === "live");
+    const initialManagers = await agent.get(`/api/admin/rooms/${room.body.id}/claim-managers`).expect(200);
+    assert.deepEqual(initialManagers.body.items.map((item) => item.bili_uid), ["24680"]);
+    const compatibleManagers = await agent.get(`/api/admin/rooms/${room.body.id}/managers`).expect(200);
+    assert.deepEqual(compatibleManagers.body.items.map((item) => item.bili_uid), ["24680"]);
+
+    const updatedManagers = await agent.put(`/api/admin/rooms/${room.body.id}/claim-managers`)
+      .send({ uids: ["556677"] })
+      .expect(200);
+    assert.deepEqual(updatedManagers.body.items.map((item) => item.bili_uid), ["24680", "556677"]);
+
+    const claimant = request.agent(app);
+    const context = await claimant.get("/api/rooms/claim-test/claim").expect(200);
+    assert.match(context.body.claim_prefix, /^Nya-bl[a-z0-9]{4}-$/);
+    assert.equal(context.body.claimed, false);
+    assert.equal(context.body.claim_manager_count, 2);
+
+    const challenge = await claimant.post("/api/rooms/claim-test/claim/challenge").send({}).expect(200);
+    assert.match(challenge.body.code, /^Nya-bl[a-z0-9]{4}-[a-z0-9]{6}$/);
+    app.locals.database.ingest({
+      type: "danmaku",
+      session_id: session.id,
+      timestamp: "2026-07-21T12:05:00.000Z",
+      user: { uid: "998877", username: "路人观众", avatar_url: "", guard_level: 0 },
+      content: challenge.body.code,
+      medal_name: "",
+      medal_level: 0,
+    });
+    const rejected = await claimant.post("/api/rooms/claim-test/claim/verify").send({}).expect(404);
+    assert.match(rejected.body.error, /已配置管理者 UID/);
+
+    app.locals.database.ingest({
+      type: "danmaku",
+      session_id: session.id,
+      timestamp: "2026-07-21T12:06:00.000Z",
+      user: { uid: "556677", username: "房管小助手", avatar_url: "", guard_level: 0 },
+      content: challenge.body.code,
+      medal_name: "",
+      medal_level: 0,
+    });
+    const verified = await claimant.post("/api/rooms/claim-test/claim/verify").send({}).expect(200);
+    assert.equal(verified.body.claim.uid, "556677");
+    assert.equal(verified.body.claim.username, "房管小助手");
+
+    const claimed = await claimant.get("/api/rooms/claim-test/claim").expect(200);
+    assert.equal(claimed.body.claimed, true);
+    assert.equal(claimed.body.claim.uid, "556677");
+
+    const auth = await claimant.get("/api/auth/me").expect(200);
+    assert.equal(auth.body.authenticated, true);
+    assert.equal(auth.body.auth_mode, "claim");
+    assert.ok(auth.body.room_claims.some((item) => item.uid === "556677" && item.alias === "claim-test"));
+
+    const roomViewer = await claimant.get(`/api/sessions/${session.id}/viewers?min_messages=0&limit=1`).expect(200);
+    await claimant
+      .put(`/api/rooms/${room.body.id}/viewer-notes/${encodeURIComponent(roomViewer.body.items[0].bili_uid)}`)
+      .send({ note: "认领备注" })
+      .expect(200);
+    const noted = await claimant.get(`/api/sessions/${session.id}/viewers?min_messages=0&limit=1`).expect(200);
+    assert.equal(noted.body.items[0].room_note, "认领备注");
   });
 });
 

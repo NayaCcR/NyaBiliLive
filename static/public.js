@@ -1,5 +1,5 @@
 const overviewCollapsed = (() => { try { return localStorage.getItem("nyabililive:overview-collapsed") === "true"; } catch { return false; } })();
-const state = { config: null, room: null, session: null, activeTab: "gifts", danmakuOffset: 0, danmakuOrder: "desc", viewerOffset: 0, viewerSort: "last_entered_at", viewerOrder: "desc", durationTimer: null, liveRefreshTimer: null, liveRefreshInFlight: false, liveRefreshGeneration: 0, danmakuRenderedOnce: false, danmakuSignature: "", viewerSignature: "", overviewCollapsed, giftData: null, giftSignature: "", giftMode: "overview", giftUserId: null, giftHistoryOrder: "desc" };
+const state = { config: null, auth: null, authenticated: false, roomAuthenticated: false, room: null, session: null, activeTab: "gifts", danmakuOffset: 0, danmakuOrder: "desc", viewerOffset: 0, viewerSort: "last_entered_at", viewerOrder: "desc", viewerData: null, viewerEditingUid: null, viewerNoteDraft: "", viewerNoteSavingUid: null, durationTimer: null, liveRefreshTimer: null, liveRefreshInFlight: false, liveRefreshGeneration: 0, danmakuRenderedOnce: false, danmakuSignature: "", viewerSignature: "", overviewCollapsed, giftData: null, giftSignature: "", giftMode: "overview", giftUserId: null, giftHistoryOrder: "desc" };
 const app = document.querySelector("#app");
 const escapeHtml = (value = "") => String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;");
 const count = (value) => new Intl.NumberFormat("zh-CN").format(Number(value || 0));
@@ -39,9 +39,15 @@ async function boot() {
   try {
     const [config, auth] = await Promise.all([api("/api/config"), api("/api/auth/me")]);
     state.config = config;
+    state.auth = auth;
+    state.authenticated = Boolean(auth.authenticated);
     document.title = config.app.site_name;
     const authEntry = document.querySelector("#auth-entry");
-    if (auth.authenticated) { authEntry.textContent = auth.username; authEntry.href = "/admin"; authEntry.classList.add("signed-in"); }
+    if (auth.authenticated) {
+      authEntry.textContent = auth.auth_mode === "admin" ? auth.username : "已认领";
+      authEntry.href = auth.auth_mode === "admin" ? "/admin" : "/";
+      authEntry.classList.add("signed-in");
+    }
     const identifier = identifierFromPath();
     if (identifier) await renderRoom(identifier); else await renderDirectory();
   } catch (error) { renderError(error.message); }
@@ -83,9 +89,20 @@ function createRoomCard(room) {
 async function renderRoom(identifier) {
   stopLiveRefresh();
   state.room = await api(`/api/rooms/${encodeURIComponent(identifier)}`);
+  state.roomAuthenticated = Boolean(
+    state.auth?.auth_mode === "admin"
+    || state.auth?.room_claims?.some((item) => Number(item.room_id) === Number(state.room.id)),
+  );
   app.replaceChildren(document.querySelector("#room-template").content.cloneNode(true));
   document.querySelector("#session-count").textContent = `${state.room.sessions.length} 个场次`;
   document.querySelector("#open-live-room").href = `https://live.bilibili.com/${encodeURIComponent(state.room.room_number)}`;
+  document.querySelector("#claim-live-room").href = `/claim/${encodeURIComponent(state.room.alias || state.room.room_number)}`;
+  const claimButton = document.querySelector("#claim-live-room");
+  const claimed = state.auth?.room_claims?.some((item) => Number(item.room_id) === Number(state.room.id));
+  if (claimed) {
+    claimButton.textContent = "已认领";
+    claimButton.classList.add("signed-in");
+  }
   bindRoomEvents();
   renderSessionStrip();
   if (state.room.sessions.length) await selectSession(state.room.sessions[0].id); else renderNoSessions();
@@ -152,6 +169,10 @@ async function selectSession(sessionId) {
   state.danmakuRenderedOnce = false;
   state.danmakuSignature = "";
   state.viewerSignature = "";
+  state.viewerData = null;
+  state.viewerEditingUid = null;
+  state.viewerNoteDraft = "";
+  state.viewerNoteSavingUid = null;
   document.querySelectorAll(".session-card").forEach((card) => card.classList.toggle("active", Number(card.dataset.sessionId) === sessionId));
   try {
     const [summary, gifts] = await Promise.all([api(`/api/sessions/${sessionId}/summary`), api(`/api/sessions/${sessionId}/gifts`)]);
@@ -246,6 +267,54 @@ function userAvatar(user) {
   return `<span class="user-avatar">${content}</span>`;
 }
 
+function viewerNoteMarkup(item) {
+  if (!state.roomAuthenticated) return "";
+  const uid = String(item.bili_uid);
+  const note = String(item.room_note || "");
+  const editing = state.viewerEditingUid === uid;
+  if (editing) {
+    return `<span class="viewer-note-editor"><input type="text" data-note-input="${escapeHtml(uid)}" value="${escapeHtml(state.viewerNoteDraft)}" maxlength="120" placeholder="输入备注后回车" aria-label="编辑用户备注"${state.viewerNoteSavingUid === uid ? " disabled" : ""}></span>`;
+  }
+  if (note) {
+    return `<button type="button" class="viewer-note viewer-note-text" data-note-edit="${escapeHtml(uid)}" title="点击修改备注">${escapeHtml(note)}</button>`;
+  }
+  return `<button type="button" class="viewer-note viewer-note-action" data-note-edit="${escapeHtml(uid)}" aria-label="添加用户备注">备注</button>`;
+}
+
+function noteBadge(user) {
+  if (!state.roomAuthenticated || !user?.room_note) return "";
+  return `<span class="room-note-badge" title="${escapeHtml(user.room_note)}">${escapeHtml(user.room_note)}</span>`;
+}
+
+function usernameWithNote(user, { medal = "", extraClass = "" } = {}) {
+  const className = ["username-line", extraClass].filter(Boolean).join(" ");
+  return `<span class="${className}"><strong>${escapeHtml(user.username)}</strong>${medal}${noteBadge(user)}</span>`;
+}
+
+function viewerDataSignature(data) {
+  return `${data.total}:${data.items.map((item) => `${item.bili_uid}:${item.last_entered_at}:${item.entry_count}:${item.message_count}:${item.room_note || ""}`).join(",")}`;
+}
+
+async function saveViewerNote(uid, note) {
+  if (!state.roomAuthenticated || !state.room) return;
+  state.viewerNoteSavingUid = uid;
+  try {
+    await api(`/api/rooms/${state.room.id}/viewer-notes/${encodeURIComponent(uid)}`, {
+      method: "PUT",
+      body: JSON.stringify({ note }),
+    });
+    state.viewerEditingUid = null;
+    state.viewerNoteDraft = "";
+    state.viewerSignature = "";
+    await loadViewers(false, { sessionId: state.session?.id });
+    toast(note.trim() ? "备注已保存" : "备注已清除");
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    state.viewerNoteSavingUid = null;
+  }
+}
+
 function renderGifts(data) {
   state.giftData = data;
   state.giftSignature = giftDataSignature(data);
@@ -261,7 +330,7 @@ function giftDataSignature(data) {
 }
 
 function giftHistoryRows(items) {
-  return items.map((gift) => `<article class="gift-history-row">${userAvatar(gift)}<span><strong>${escapeHtml(gift.username)}</strong><small>${escapeHtml(gift.gift_name)} × ${count(gift.count)}</small></span>${giftAmount(gift.total_value)}<time>${formatTimestamp(gift.received_at)}</time></article>`).join("") || '<div class="empty-inline">暂无礼物流水</div>';
+  return items.map((gift) => `<article class="gift-history-row">${userAvatar(gift)}<span>${usernameWithNote(gift)}<small>${escapeHtml(gift.gift_name)} × ${count(gift.count)}</small></span>${giftAmount(gift.total_value)}<time>${formatTimestamp(gift.received_at)}</time></article>`).join("") || '<div class="empty-inline">暂无礼物流水</div>';
 }
 
 function orderedGiftHistory(items) {
@@ -277,7 +346,7 @@ function giftHistoryOrderControl() {
 }
 
 function giftOverview(data) {
-  return `<div class="two-column-data"><section><header class="data-title"><div><p class="kicker">SUPPORT RANKING</p><h3>本场支持榜</h3></div><span>${data.ranking.length} 位</span></header><div class="ranking-list">${data.ranking.map((user, index) => `<article class="ranking-row"><b>${index + 1}</b>${userAvatar(user)}<span><strong>${escapeHtml(user.username)}</strong><small>${count(user.gift_count)} 件礼物</small></span>${giftAmount(user.total_value)}</article>`).join("") || '<div class="empty-inline">暂无打赏记录</div>'}</div></section><section><header class="data-title"><div><p class="kicker">GIFT BREAKDOWN</p><h3>礼物信息</h3></div><span>${data.gifts.length} 种</span></header><div class="gift-list">${data.gifts.map((gift) => `<article class="gift-row"><span class="gift-icon">${initials(gift.gift_name)}</span><span><strong>${escapeHtml(gift.gift_name)}</strong><small>${count(gift.count)} 件</small></span>${giftAmount(gift.total_value)}</article>`).join("") || '<div class="empty-inline">暂无礼物记录</div>'}</div></section></div>`;
+  return `<div class="two-column-data"><section><header class="data-title"><div><p class="kicker">SUPPORT RANKING</p><h3>本场支持榜</h3></div><span>${data.ranking.length} 位</span></header><div class="ranking-list">${data.ranking.map((user, index) => `<article class="ranking-row"><b>${index + 1}</b>${userAvatar(user)}<span>${usernameWithNote(user)}<small>${count(user.gift_count)} 件礼物</small></span>${giftAmount(user.total_value)}</article>`).join("") || '<div class="empty-inline">暂无打赏记录</div>'}</div></section><section><header class="data-title"><div><p class="kicker">GIFT BREAKDOWN</p><h3>礼物信息</h3></div><span>${data.gifts.length} 种</span></header><div class="gift-list">${data.gifts.map((gift) => `<article class="gift-row"><span class="gift-icon">${initials(gift.gift_name)}</span><span><strong>${escapeHtml(gift.gift_name)}</strong><small>${count(gift.count)} 件</small></span>${giftAmount(gift.total_value)}</article>`).join("") || '<div class="empty-inline">暂无礼物记录</div>'}</div></section></div>`;
 }
 
 function giftHistoryOverview(data) {
@@ -288,7 +357,7 @@ function giftPersonal(data) {
   const user = data.ranking.find((item) => String(item.bili_uid) === state.giftUserId);
   if (!user) return '<div class="empty-inline">暂无个人送礼记录</div>';
   const history = orderedGiftHistory(data.history.filter((item) => String(item.bili_uid) === state.giftUserId));
-  return `<section class="personal-gift-summary"><header>${userAvatar(user)}<span><strong>${escapeHtml(user.username)}</strong><small>UID ${escapeHtml(user.bili_uid)}</small></span></header><div><span><small>累计礼物</small><strong>${count(user.gift_count)} 件</strong></span><span><small>原始单位</small><strong>${batteries(user.total_value)}</strong></span><span><small>折算金额</small><strong>${money(user.total_value)}</strong></span><span><small>流水记录</small><strong>${count(history.length)} 条</strong></span></div></section><section class="gift-history-section"><header class="data-title"><div><p class="kicker">PERSONAL GIFT HISTORY</p><h3>个人送礼记录</h3></div><span>${history.length} 条</span></header><div class="list-toolbar gift-history-toolbar"><p class="result-note">按送礼时间排列</p>${giftHistoryOrderControl()}</div><div class="gift-history-list">${giftHistoryRows(history)}</div></section>`;
+  return `<section class="personal-gift-summary"><header>${userAvatar(user)}<span>${usernameWithNote(user)}<small>UID ${escapeHtml(user.bili_uid)}</small></span></header><div><span><small>累计礼物</small><strong>${count(user.gift_count)} 件</strong></span><span><small>原始单位</small><strong>${batteries(user.total_value)}</strong></span><span><small>折算金额</small><strong>${money(user.total_value)}</strong></span><span><small>流水记录</small><strong>${count(history.length)} 条</strong></span></div></section><section class="gift-history-section"><header class="data-title"><div><p class="kicker">PERSONAL GIFT HISTORY</p><h3>个人送礼记录</h3></div><span>${history.length} 条</span></header><div class="list-toolbar gift-history-toolbar"><p class="result-note">按送礼时间排列</p>${giftHistoryOrderControl()}</div><div class="gift-history-list">${giftHistoryRows(history)}</div></section>`;
 }
 
 function renderGiftPanel() {
@@ -296,7 +365,7 @@ function renderGiftPanel() {
   const data = state.giftData;
   if (!panel || !data) return;
   const userSelect = state.giftMode === "personal" && data.ranking.length
-    ? `<label class="gift-user-select"><span>用户</span><select id="gift-user-select">${data.ranking.map((user) => `<option value="${escapeHtml(user.bili_uid)}" ${String(user.bili_uid) === state.giftUserId ? "selected" : ""}>${escapeHtml(user.username)} · ${escapeHtml(user.bili_uid)}</option>`).join("")}</select></label>`
+    ? `<label class="gift-user-select"><span>用户</span><select id="gift-user-select">${data.ranking.map((user) => `<option value="${escapeHtml(user.bili_uid)}" ${String(user.bili_uid) === state.giftUserId ? "selected" : ""}>${escapeHtml(user.username)}${user.room_note ? ` · ${escapeHtml(user.room_note)}` : ""} · ${escapeHtml(user.bili_uid)}</option>`).join("")}</select></label>`
     : "";
   const giftViews = { overview: giftOverview, history: giftHistoryOverview, personal: giftPersonal };
   const renderView = giftViews[state.giftMode] || giftOverview;
@@ -326,7 +395,7 @@ async function loadDanmaku(reset = true, { silent = false, animateNew = false, s
     if (silent && signature === state.danmakuSignature) return;
     const rows = data.items.map((item) => {
       const arriving = animateNew && state.danmakuRenderedOnce && !previousIds.has(String(item.id));
-      return `<article class="danmaku-row${arriving ? " live-arrival" : ""}" data-danmaku-id="${item.id}">${userAvatar(item)}<div><header><strong>${escapeHtml(item.username)}</strong>${item.medal_name ? `<span class="medal">${escapeHtml(item.medal_name)} ${item.medal_level}</span>` : ""}<time>${formatTimestamp(item.sent_at)}</time></header><p>${escapeHtml(item.content)}</p></div></article>`;
+      return `<article class="danmaku-row${arriving ? " live-arrival" : ""}" data-danmaku-id="${item.id}">${userAvatar(item)}<div><header>${usernameWithNote(item, { medal: item.medal_name ? `<span class="medal">${escapeHtml(item.medal_name)} ${item.medal_level}</span>` : "" })}<time>${formatTimestamp(item.sent_at)}</time></header><p>${escapeHtml(item.content)}</p></div></article>`;
     }).join("") || '<div class="empty-inline">没有符合条件的弹幕</div>';
     panel.innerHTML = `<header class="data-title responsive"><div><p class="kicker">DANMAKU HISTORY</p><h3>弹幕历史</h3></div><form class="search-form" id="danmaku-form"><input id="danmaku-search" type="search" value="${escapeHtml(query)}" placeholder="搜索弹幕、用户或 UID"><button>搜索</button></form></header><div class="list-toolbar"><p class="result-note">${count(data.total)} 条记录</p><nav class="segmented-control" aria-label="弹幕发送时间排序"><button type="button" data-danmaku-order="desc" class="${state.danmakuOrder === "desc" ? "active" : ""}">最新优先</button><button type="button" data-danmaku-order="asc" class="${state.danmakuOrder === "asc" ? "active" : ""}">最早优先</button></nav></div><div class="danmaku-list">${rows}</div><div class="pagination"><button id="danmaku-prev" ${state.danmakuOffset === 0 ? "disabled" : ""}>上一页</button><button id="danmaku-next" ${state.danmakuOffset + data.items.length >= data.total ? "disabled" : ""}>下一页</button></div>`;
     state.danmakuRenderedOnce = true;
@@ -348,14 +417,46 @@ async function loadViewers(reset = false, { silent = false, sessionId = state.se
     const limit = 100;
     const data = await api(`/api/sessions/${sessionId}/viewers?min_messages=${encodeURIComponent(minimum)}&q=${encodeURIComponent(query)}&limit=${limit}&offset=${state.viewerOffset}&sort=${state.viewerSort}&order=${state.viewerOrder}`);
     if (state.session?.id !== sessionId) return;
-    const signature = `${data.total}:${data.items.map((item) => `${item.bili_uid}:${item.last_entered_at}:${item.entry_count}:${item.message_count}`).join(",")}`;
+    state.viewerData = data;
+    const signature = viewerDataSignature(data);
     if (silent && signature === state.viewerSignature) return;
-    panel.innerHTML = `<header class="data-title responsive"><div><p class="kicker">AUDIENCE LOG</p><h3>进房与发言用户</h3></div><form class="viewer-filters" id="viewer-form"><label>至少发言 <input id="message-min" type="number" min="0" value="${Number(minimum)}"> 条</label><input id="viewer-search" type="search" value="${escapeHtml(query)}" placeholder="用户名或 UID"><button>筛选</button></form></header><div class="list-toolbar"><p class="result-note">显示 ${count(data.total)} 位用户</p><div class="sort-controls"><label class="sort-select">排序依据 <select id="viewer-sort"><option value="last_entered_at" ${state.viewerSort === "last_entered_at" ? "selected" : ""}>最近进入时间</option><option value="first_entered_at" ${state.viewerSort === "first_entered_at" ? "selected" : ""}>首次进入时间</option></select></label><nav class="segmented-control" aria-label="进房用户排序方向"><button type="button" data-viewer-order="desc" class="${state.viewerOrder === "desc" ? "active" : ""}">倒序</button><button type="button" data-viewer-order="asc" class="${state.viewerOrder === "asc" ? "active" : ""}">正序</button></nav></div></div><div class="table-wrap"><table><thead><tr><th>用户</th><th>UID</th><th>首次进入</th><th>最近进入</th><th>进入</th><th>发言</th></tr></thead><tbody>${data.items.map((item) => `<tr><td><span class="user-cell">${userAvatar(item)}<strong>${escapeHtml(item.username)}</strong></span></td><td>${escapeHtml(item.bili_uid)}</td><td>${formatTimestamp(item.first_entered_at)}</td><td>${formatTimestamp(item.last_entered_at)}</td><td>${count(item.entry_count)}</td><td><strong>${count(item.message_count)}</strong></td></tr>`).join("") || '<tr><td colspan="6" class="empty-cell">没有符合条件的用户</td></tr>'}</tbody></table></div><div class="pagination"><button id="viewer-prev" ${state.viewerOffset === 0 ? "disabled" : ""}>上一页</button><button id="viewer-next" ${state.viewerOffset + data.items.length >= data.total ? "disabled" : ""}>下一页</button></div>`;
+    panel.innerHTML = `<header class="data-title responsive"><div><p class="kicker">AUDIENCE LOG</p><h3>进房与发言用户</h3></div><form class="viewer-filters" id="viewer-form"><label>至少发言 <input id="message-min" type="number" min="0" value="${Number(minimum)}"> 条</label><input id="viewer-search" type="search" value="${escapeHtml(query)}" placeholder="用户名或 UID"><button>筛选</button></form></header><div class="list-toolbar"><p class="result-note">显示 ${count(data.total)} 位用户</p><div class="sort-controls"><label class="sort-select">排序依据 <select id="viewer-sort"><option value="last_entered_at" ${state.viewerSort === "last_entered_at" ? "selected" : ""}>最近进入时间</option><option value="first_entered_at" ${state.viewerSort === "first_entered_at" ? "selected" : ""}>首次进入时间</option></select></label><nav class="segmented-control" aria-label="进房用户排序方向"><button type="button" data-viewer-order="desc" class="${state.viewerOrder === "desc" ? "active" : ""}">倒序</button><button type="button" data-viewer-order="asc" class="${state.viewerOrder === "asc" ? "active" : ""}">正序</button></nav></div></div><div class="table-wrap"><table><thead><tr><th>用户</th><th class="viewer-uid-column">UID</th><th>首次进入</th><th>最近进入</th><th>进入</th><th>发言</th></tr></thead><tbody>${data.items.map((item) => `<tr class="viewer-table-row"><td><span class="user-cell">${userAvatar(item)}<strong>${escapeHtml(item.username)}</strong></span></td><td class="viewer-uid-column"><span class="viewer-uid-cell">${viewerNoteMarkup(item)}<span class="viewer-uid-value">${escapeHtml(item.bili_uid)}</span></span></td><td>${formatTimestamp(item.first_entered_at)}</td><td>${formatTimestamp(item.last_entered_at)}</td><td>${count(item.entry_count)}</td><td><strong>${count(item.message_count)}</strong></td></tr>`).join("") || '<tr><td colspan="6" class="empty-cell">没有符合条件的用户</td></tr>'}</tbody></table></div><div class="pagination"><button id="viewer-prev" ${state.viewerOffset === 0 ? "disabled" : ""}>上一页</button><button id="viewer-next" ${state.viewerOffset + data.items.length >= data.total ? "disabled" : ""}>下一页</button></div>`;
     panel.querySelector("#viewer-form").addEventListener("submit", (event) => { event.preventDefault(); loadViewers(true); });
     panel.querySelector("#viewer-sort").addEventListener("change", (event) => { state.viewerSort = event.currentTarget.value; loadViewers(true); });
     panel.querySelectorAll("[data-viewer-order]").forEach((button) => button.addEventListener("click", () => { state.viewerOrder = button.dataset.viewerOrder; loadViewers(true); }));
     panel.querySelector("#viewer-prev").addEventListener("click", () => { state.viewerOffset = Math.max(0, state.viewerOffset - limit); loadViewers(false); });
     panel.querySelector("#viewer-next").addEventListener("click", () => { state.viewerOffset += limit; loadViewers(false); });
+    panel.querySelectorAll("[data-note-edit]").forEach((button) => button.addEventListener("click", () => {
+      const uid = button.dataset.noteEdit;
+      const item = data.items.find((entry) => String(entry.bili_uid) === uid);
+      state.viewerEditingUid = uid;
+      state.viewerNoteDraft = String(item?.room_note || "");
+      state.viewerSignature = "";
+      loadViewers(false, { sessionId });
+    }));
+    panel.querySelectorAll("[data-note-input]").forEach((input) => {
+      input.addEventListener("keydown", async (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          await saveViewerNote(event.currentTarget.dataset.noteInput, event.currentTarget.value);
+        }
+        if (event.key === "Escape") {
+          state.viewerEditingUid = null;
+          state.viewerNoteDraft = "";
+          state.viewerSignature = "";
+          loadViewers(false, { sessionId });
+        }
+      });
+      input.addEventListener("blur", () => {
+        if (state.viewerNoteSavingUid === input.dataset.noteInput) return;
+        state.viewerEditingUid = null;
+        state.viewerNoteDraft = "";
+        state.viewerSignature = "";
+        loadViewers(false, { sessionId });
+      });
+      input.focus();
+      input.select();
+    });
     state.viewerSignature = signature;
   } catch (error) { panel.innerHTML = `<div class="empty-inline error">${escapeHtml(error.message)}</div>`; }
 }

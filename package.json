@@ -8,7 +8,7 @@
     "dev": "node --watch server/index.js",
     "start": "node server/index.js",
     "seed": "node server/cli.js seed",
-    "check": "node --check server/index.js && node --check server/database.js && node --check server/bilibili.js && node --check server/bilibili-auth.js && node --check server/bilibili-profile.js && node --check server/danmaku.js && node --check server/media.js && node --check server/schemas.js && node --check static/public.js && node --check static/console.js",
+    "check": "node --check server/index.js && node --check server/database.js && node --check server/bilibili.js && node --check server/bilibili-auth.js && node --check server/bilibili-profile.js && node --check server/danmaku.js && node --check server/media.js && node --check server/schemas.js && node --check static/public.js && node --check static/claim.js && node --check static/console.js",
     "test": "node --test"
   },
   "engines": {

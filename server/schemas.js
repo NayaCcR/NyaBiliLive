@@ -117,3 +117,15 @@ export const changePasswordSchema = z.object({
   message: "两次输入的新密码不一致",
   path: ["confirm_password"],
 });
+
+export const viewerNoteUpdateSchema = z.object({
+  note: z.string().trim().max(120).default(""),
+});
+
+const managerUidSchema = z.union([z.string(), z.number()])
+  .transform((value) => String(value).trim())
+  .refine((value) => /^\d{1,20}$/.test(value), "管理者 UID 必须是纯数字");
+
+export const roomClaimManagersUpdateSchema = z.object({
+  uids: z.array(managerUidSchema).max(200).default([]),
+});
