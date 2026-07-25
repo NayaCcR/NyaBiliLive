@@ -604,7 +604,11 @@ export function createApp({
   });
 
   app.post("/api/admin/danmaku/restart", requireAdmin, (_request, response) => {
-    danmakuCollector.restart();
+    const restart = danmakuCollector.manualRestart();
+    if (!restart.ok) {
+      response.set("Retry-After", String(restart.retryAfterSeconds));
+      return response.status(429).json({ error: `重连操作冷却中，请 ${restart.retryAfterSeconds} 秒后再试` });
+    }
     response.json({ ok: true, danmaku: danmakuCollector.status() });
   });
 

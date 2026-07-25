@@ -3,8 +3,14 @@ import { parseBilibiliCookie } from "./bilibili-auth.js";
 import { fetchBilibiliUserProfiles } from "./bilibili-profile.js";
 
 const PROFILE_BATCH_SIZE = 20;
-const PROFILE_BATCH_DELAY = 1200;
+const PROFILE_BATCH_DELAY = 15_000;
 const PROFILE_RETRY_DELAY = 6 * 60 * 60 * 1000;
+const PROFILE_ERROR_BASE_DELAY = 15 * 60_000;
+const PROFILE_ERROR_MAX_DELAY = 6 * 60 * 60_000;
+const HEARTBEAT_TIMEOUT = 120_000;
+const RECONNECT_BASE_DELAY = 30_000;
+const RECONNECT_MAX_DELAY = 5 * 60_000;
+const MANUAL_RESTART_COOLDOWN = 30_000;
 
 function toIsoTimestamp(value) {
   const numeric = Number(value || Date.now());
@@ -148,6 +154,10 @@ export class DanmakuCollector {
     this.profileInFlight = false;
     this.profileGeneration = 0;
     this.lastProfileError = "";
+    this.profileFailureStreak = 0;
+    this.profileRetryAt = null;
+    this.heartbeatRecovery = new Map();
+    this.lastManualRestartAt = 0;
   }
 
   status() {
@@ -170,6 +180,7 @@ export class DanmakuCollector {
         pending: this.pendingProfileUids.size,
         running: this.profileInFlight,
         last_error: this.lastProfileError,
+        retry_at: this.profileRetryAt ? new Date(this.profileRetryAt).toISOString() : null,
       },
       rooms: [...this.connections.values()].map((connection) => ({
         room_id: connection.roomId,
@@ -178,6 +189,12 @@ export class DanmakuCollector {
         status: connection.status,
         connected_at: connection.connectedAt,
         last_event_at: connection.lastEventAt,
+        last_heartbeat_at: connection.lastHeartbeatAt,
+        heartbeat_status: this.heartbeatStatus(connection),
+        heartbeat_restart_count: connection.heartbeatRestartCount,
+        reconnect_failure_streak: connection.reconnectFailureStreak,
+        last_recovery_at: connection.lastRecoveryAt,
+        last_recovery_reason: connection.lastRecoveryReason,
         message_count: connection.messageCount,
         last_error: connection.lastError,
         retry_at: connection.retryAt ? new Date(connection.retryAt).toISOString() : null,
@@ -210,6 +227,71 @@ export class DanmakuCollector {
     this.start();
   }
 
+  manualRestart() {
+    const remaining = MANUAL_RESTART_COOLDOWN - (Date.now() - this.lastManualRestartAt);
+    if (remaining > 0) return { ok: false, retryAfterSeconds: Math.ceil(remaining / 1000) };
+    this.lastManualRestartAt = Date.now();
+    this.restart();
+    return { ok: true, retryAfterSeconds: 0 };
+  }
+
+  heartbeatStatus(connection) {
+    if (["closed", "error"].includes(connection.status)) return "offline";
+    const latestActivity = Math.max(
+      Date.parse(connection.lastHeartbeatAt || "") || 0,
+      Date.parse(connection.lastEventAt || "") || 0,
+      Date.parse(connection.connectedAt || "") || 0,
+    );
+    if (!latestActivity) return "waiting";
+    return Date.now() - latestActivity >= HEARTBEAT_TIMEOUT ? "stale" : connection.lastHeartbeatAt ? "healthy" : "waiting";
+  }
+
+  scheduleRecovery(connection, reason, status = "error") {
+    if (connection.recoveryScheduled) {
+      connection.status = status;
+      return;
+    }
+    const previous = this.heartbeatRecovery.get(connection.roomId) || { count: 0, failureStreak: 0 };
+    const failureStreak = previous.failureStreak + 1;
+    const baseDelay = Math.min(RECONNECT_BASE_DELAY * (2 ** (failureStreak - 1)), RECONNECT_MAX_DELAY);
+    const delay = Math.min(
+      RECONNECT_MAX_DELAY,
+      Math.ceil((baseDelay * (1 + Math.random() * 0.2)) / 1000) * 1000,
+    );
+    const recovery = {
+      count: previous.count,
+      failureStreak,
+      at: new Date().toISOString(),
+      retryAt: Date.now() + delay,
+      reason: `${reason}，${delay / 1000} 秒后重连`,
+    };
+    this.heartbeatRecovery.set(connection.roomId, recovery);
+    connection.status = status;
+    connection.lastError = recovery.reason;
+    connection.retryAt = recovery.retryAt;
+    connection.recoveryScheduled = true;
+    connection.heartbeatRestartCount = recovery.count;
+    connection.reconnectFailureStreak = failureStreak;
+    connection.lastRecoveryAt = recovery.at;
+    connection.lastRecoveryReason = recovery.reason;
+    this.logger.warn?.(`[danmaku] room ${connection.roomNumber}: ${recovery.reason}`);
+  }
+
+  cancelPendingRecovery(connection, { healthy = false } = {}) {
+    if (!connection.recoveryScheduled && !healthy) return;
+    const previous = this.heartbeatRecovery.get(connection.roomId);
+    if (previous) {
+      this.heartbeatRecovery.set(connection.roomId, {
+        ...previous,
+        failureStreak: healthy ? 0 : previous.failureStreak,
+        retryAt: null,
+      });
+    }
+    connection.recoveryScheduled = false;
+    connection.retryAt = null;
+    if (healthy) connection.reconnectFailureStreak = 0;
+  }
+
   queueUserProfile(user) {
     const uid = String(user?.uid || "");
     if (!/^[1-9]\d*$/.test(uid)) return;
@@ -233,11 +315,13 @@ export class DanmakuCollector {
 
   scheduleProfileFlush(delay = PROFILE_BATCH_DELAY) {
     if (this.profileTimer || this.profileInFlight || !this.pendingProfileUids.size) return;
+    const retryDelay = this.profileRetryAt ? Math.max(0, this.profileRetryAt - Date.now()) : 0;
+    const effectiveDelay = Math.max(delay, retryDelay);
     const generation = this.profileGeneration;
     this.profileTimer = setTimeout(() => {
       this.profileTimer = null;
       if (generation === this.profileGeneration) void this.flushProfileQueue();
-    }, delay);
+    }, effectiveDelay);
     this.profileTimer.unref?.();
   }
 
@@ -257,14 +341,22 @@ export class DanmakuCollector {
       if (generation !== this.profileGeneration) return;
       for (const profile of profiles) this.database.updateUserProfile(profile);
       this.lastProfileError = "";
+      this.profileFailureStreak = 0;
+      this.profileRetryAt = null;
     } catch (error) {
       if (generation !== this.profileGeneration) return;
       this.lastProfileError = error instanceof Error ? error.message : String(error);
+      this.profileFailureStreak += 1;
+      const delay = Math.min(
+        PROFILE_ERROR_BASE_DELAY * (2 ** (this.profileFailureStreak - 1)),
+        PROFILE_ERROR_MAX_DELAY,
+      );
+      this.profileRetryAt = Date.now() + delay;
       this.logger.warn?.(`[danmaku] user profile enrichment: ${this.lastProfileError}`);
     } finally {
       if (generation === this.profileGeneration) {
         this.profileInFlight = false;
-        this.scheduleProfileFlush();
+        this.scheduleProfileFlush(this.profileRetryAt ? Math.max(0, this.profileRetryAt - Date.now()) : PROFILE_BATCH_DELAY);
       }
     }
   }
@@ -279,12 +371,31 @@ export class DanmakuCollector {
       }
       for (const room of desired.values()) {
         const current = this.connections.get(room.id);
+        const heartbeatExpired = current && this.heartbeatStatus(current) === "stale";
+        if (heartbeatExpired && !current.recoveryScheduled) {
+          const elapsed = Math.floor((Date.now() - Math.max(
+            Date.parse(current.lastHeartbeatAt || "") || 0,
+            Date.parse(current.lastEventAt || "") || 0,
+            Date.parse(current.connectedAt || "") || 0,
+          )) / 1000);
+          this.scheduleRecovery(current, `心跳或消息已静默 ${elapsed} 秒`);
+        } else if (current?.instance?.closed && !["closed", "error"].includes(current.status)) {
+          this.scheduleRecovery(current, "底层连接已关闭", "closed");
+        }
         const retryReady = current && (!current.retryAt || Date.now() >= current.retryAt);
         const needsRestart = current && (
           (["closed", "error"].includes(current.status) && retryReady)
-          || (!['connecting', 'closed', 'error'].includes(current.status) && current.instance?.closed)
         );
         if (!current || current.sessionId !== room.session_id || needsRestart) {
+          if (needsRestart) {
+            const recovery = this.heartbeatRecovery.get(room.id);
+            if (recovery) this.heartbeatRecovery.set(room.id, {
+              ...recovery,
+              count: recovery.count + 1,
+              at: new Date().toISOString(),
+              reason: `${recovery.reason}（已执行）`,
+            });
+          }
           if (current) this.stopRoom(room.id);
           this.startRoom(room);
         }
@@ -296,6 +407,7 @@ export class DanmakuCollector {
   }
 
   startRoom(room) {
+    const recovery = this.heartbeatRecovery.get(room.id) || { count: 0, failureStreak: 0, at: null, reason: "" };
     const connection = {
       roomId: room.id,
       roomNumber: String(room.room_number),
@@ -304,10 +416,16 @@ export class DanmakuCollector {
       status: "connecting",
       connectedAt: null,
       lastEventAt: null,
+      lastHeartbeatAt: null,
+      heartbeatRestartCount: recovery.count,
+      reconnectFailureStreak: recovery.failureStreak,
+      lastRecoveryAt: recovery.at,
+      lastRecoveryReason: recovery.reason,
       messageCount: 0,
       lastError: "",
       handshakeTimer: null,
       retryAt: null,
+      recoveryScheduled: false,
       stopped: false,
       recentGiftTrades: new Map(),
     };
@@ -319,9 +437,19 @@ export class DanmakuCollector {
       connection.status = "listening";
       connection.connectedAt ||= new Date().toISOString();
       connection.lastError = "";
-      connection.retryAt = null;
+      this.cancelPendingRecovery(connection);
       connection.lastEventAt = new Date().toISOString();
       connection.messageCount += 1;
+    };
+    const recordHeartbeat = () => {
+      if (!isCurrent()) return;
+      clearHandshakeTimer();
+      const timestamp = new Date().toISOString();
+      connection.status = "listening";
+      connection.connectedAt ||= timestamp;
+      connection.lastHeartbeatAt = timestamp;
+      connection.lastError = "";
+      this.cancelPendingRecovery(connection, { healthy: true });
     };
     const clearHandshakeTimer = () => {
       if (connection.handshakeTimer) clearTimeout(connection.handshakeTimer);
@@ -341,10 +469,7 @@ export class DanmakuCollector {
       if (!isCurrent()) return;
       clearHandshakeTimer();
       const message = error instanceof Error ? error.message : String(error);
-      connection.status = "error";
-      connection.lastError = message;
-      connection.retryAt = Date.now() + 30_000;
-      this.logger.warn?.(`[danmaku] room ${room.room_number}: ${message}`);
+      this.scheduleRecovery(connection, message);
     };
     const ingest = (event) => {
       if (!isCurrent()) return;
@@ -360,13 +485,13 @@ export class DanmakuCollector {
       }
     };
     const handler = {
-      onOpen: () => { if (!isCurrent()) return; connection.status = "connected"; connection.connectedAt = new Date().toISOString(); connection.lastError = ""; connection.retryAt = null; },
+      onOpen: () => { if (!isCurrent()) return; connection.status = "connected"; connection.connectedAt = new Date().toISOString(); connection.lastError = ""; this.cancelPendingRecovery(connection); },
       onStartListen: () => {
         if (!isCurrent()) return;
-        clearHandshakeTimer(); connection.status = "listening"; connection.connectedAt ||= new Date().toISOString(); connection.lastError = ""; connection.retryAt = null;
+        clearHandshakeTimer(); connection.status = "listening"; connection.connectedAt ||= new Date().toISOString(); connection.lastError = ""; this.cancelPendingRecovery(connection);
         this.logger.info?.(`[danmaku] listening room ${room.room_number}, uid ${parseBilibiliCookie(this.config.value.security.bilibili_cookie).uid || 0}`);
       },
-      onClose: () => { if (!isCurrent()) return; clearHandshakeTimer(); connection.status = "closed"; connection.lastError = "连接已关闭，30 秒后重试"; connection.retryAt = Date.now() + 30_000; },
+      onClose: () => { if (!isCurrent()) return; clearHandshakeTimer(); this.scheduleRecovery(connection, "连接已关闭", "closed"); },
       onError: reportError,
       onIncomeDanmu: (message) => {
         const body = message.body;
@@ -445,6 +570,7 @@ export class DanmakuCollector {
       },
       onAttentionChange: (message) => {
         if (!isCurrent()) return;
+        recordHeartbeat();
         try {
           const session = this.database.getActiveSessionForRoom(room.id);
           if (session) this.database.updateSession(session.id, {
@@ -453,6 +579,13 @@ export class DanmakuCollector {
         } catch (error) {
           reportError(error);
         }
+      },
+      onWatchedChange: () => {
+        if (!isCurrent()) return;
+        connection.lastEventAt = new Date().toISOString();
+        connection.status = "listening";
+        connection.lastError = "";
+        this.cancelPendingRecovery(connection);
       },
       raw: {
         COMBO_SEND: (raw) => {
@@ -479,6 +612,7 @@ export class DanmakuCollector {
       const auth = parseBilibiliCookie(cookie);
       connection.instance = this.listenerFactory(Number(room.room_number), handler, {
         ws: {
+          keepalive: false,
           uid: auth.uid,
           ...(auth.buvid ? { buvid: auth.buvid } : {}),
           headers: {

@@ -351,6 +351,8 @@ th:last-child, td:last-child { text-align: right; }
 .danmaku-connection-row > span:not(.state-chip) { display: grid; gap: 3px; }
 .danmaku-connection-row small { color: var(--muted-foreground); font-size: 9px; }
 .danmaku-connection-row > .error-text { grid-column: 1 / -1; }
+.danmaku-connection-row > .collector-recovery { grid-column: 1 / -1; color: var(--green); }
+.danmaku-connection-row > .collector-backoff { grid-column: 1 / -1; color: var(--muted-foreground); }
 .collector-error { margin: 0; padding: 12px 18px; display: grid; gap: 4px; color: var(--red); background: #fff5f5; }
 .collector-error strong { font-size: 10px; }
 .collector-error span { overflow-wrap: anywhere; font-size: 10px; }

@@ -100,7 +100,7 @@ beforeEach(() => {
       },
     },
     danmakuListenerFactory(roomNumber, handler, options) {
-      const instance = { roomNumber, handler, options, closed: false, close() { this.closed = true; } };
+      const instance = { roomNumber, handler, options, closed: false, heartbeatCount: 0, close() { this.closed = true; }, heartbeat() { this.heartbeatCount += 1; } };
       danmakuConnections.push(instance);
       return instance;
     },
@@ -506,8 +506,12 @@ describe("administration and ingestion", () => {
     const connection = danmakuConnections.find((item) => String(item.roomNumber) === "7788");
     assert.ok(connection);
     assert.equal(connection.options.ws.uid, 0);
+    assert.equal(connection.options.ws.keepalive, false);
     connection.handler.onOpen();
     connection.handler.onStartListen();
+    connection.handler.onAttentionChange({ body: { attention: 2048 } });
+    app.locals.danmakuCollector.reconcile();
+    assert.equal(connection.heartbeatCount, 0);
 
     const user = { uid: 778899, uname: "采集测试观众", face: "", identity: { guard_level: 0 } };
     connection.handler.onUserAction({ id: "enter-1", timestamp: 1_752_688_100_000, body: { action: "enter", timestamp: 1_752_688_100_000, user } });
@@ -579,6 +583,8 @@ describe("administration and ingestion", () => {
     const status = monitor.body.danmaku.rooms.find((item) => item.room_number === "7788");
     assert.equal(status.status, "listening");
     assert.equal(status.message_count, 7);
+    assert.equal(status.heartbeat_status, "healthy");
+    assert.ok(status.last_heartbeat_at);
 
     connection.handler.onClose();
     const closedMonitor = await agent.get("/api/admin/monitor").expect(200);
@@ -592,6 +598,7 @@ describe("administration and ingestion", () => {
     assert.equal(recoveredStatus.status, "listening");
     assert.equal(recoveredStatus.last_error, "");
     assert.equal(recoveredStatus.message_count, 8);
+    connection.handler.onAttentionChange({ body: { attention: 2048 } });
 
     const missingAvatarUser = { uid: 889900, uname: "等待头像补全", face: "", identity: { guard_level: 0 } };
     profileResponse = [{ uid: "889900", username: "头像已补全", avatar_url: "https://i1.hdslb.com/bfs/face/enriched.jpg" }];
@@ -602,7 +609,25 @@ describe("administration and ingestion", () => {
     assert.equal(enriched.body.items[0].username, "等待头像补全");
     assert.equal(enriched.body.items[0].avatar_url, "https://i1.hdslb.com/bfs/face/enriched.jpg");
 
-    app.locals.danmakuCollector.stopRoom(created.body.id);
+    const staleConnection = app.locals.danmakuCollector.connections.get(created.body.id);
+    const staleTimestamp = new Date(Date.now() - 5 * 60_000).toISOString();
+    staleConnection.connectedAt = staleTimestamp;
+    staleConnection.lastEventAt = staleTimestamp;
+    staleConnection.lastHeartbeatAt = staleTimestamp;
+    app.locals.danmakuCollector.reconcile();
+    const waitingForRecovery = (await agent.get("/api/admin/monitor").expect(200)).body.danmaku.rooms.find((item) => item.room_number === "7788");
+    assert.equal(waitingForRecovery.status, "error");
+    assert.equal(waitingForRecovery.reconnect_failure_streak, 1);
+    assert.ok(Date.parse(waitingForRecovery.retry_at) - Date.now() > 20_000);
+    assert.equal(danmakuConnections.filter((item) => String(item.roomNumber) === "7788").at(-1), connection);
+    staleConnection.retryAt = Date.now() - 1;
+    app.locals.danmakuCollector.reconcile();
+    const replacement = danmakuConnections.filter((item) => String(item.roomNumber) === "7788").at(-1);
+    assert.notEqual(replacement, connection);
+    assert.equal(connection.closed, true);
+    const recoveredByHeartbeat = (await agent.get("/api/admin/monitor").expect(200)).body.danmaku.rooms.find((item) => item.room_number === "7788");
+    assert.equal(recoveredByHeartbeat.heartbeat_restart_count, 1);
+    assert.match(recoveredByHeartbeat.last_recovery_reason, /静默.*秒后重连/);
     connection.handler.onIncomeDanmu({ id: "stale-danmaku", timestamp: 1_752_688_104_000, body: { timestamp: 1_752_688_104_000, user, content: "旧连接不应写入" } });
     const staleResult = await request(app).get(`/api/sessions/${session.id}/danmaku?q=${encodeURIComponent("旧连接不应写入")}`).expect(200);
     assert.equal(staleResult.body.total, 0);
@@ -660,6 +685,9 @@ describe("administration and ingestion", () => {
     });
     const restarted = await agent.post("/api/admin/danmaku/restart").send({}).expect(200);
     assert.equal(restarted.body.ok, true);
+    const throttledRestart = await agent.post("/api/admin/danmaku/restart").send({}).expect(429);
+    assert.match(throttledRestart.body.error, /冷却中/);
+    assert.ok(Number(throttledRestart.headers["retry-after"]) > 0);
 
     bilibiliSnapshot = {
       bili_uid: "99", streamer_name: "登录采集测试", avatar_url: "", live_status: 1,
