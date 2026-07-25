@@ -515,6 +515,11 @@ describe("administration and ingestion", () => {
     rawDanmakuInfo[0] = [];
     rawDanmakuInfo[0][15] = { user: { base: { face: "https://i0.hdslb.com/bfs/face/raw-avatar.jpg" } } };
     connection.handler.onIncomeDanmu({ id: "danmaku-1", timestamp: 1_752_688_101_000, raw: { info: rawDanmakuInfo }, body: { timestamp: 1_752_688_101_000, user, content: "WebSocket 采集成功" } });
+    connection.handler.onIncomeSuperChat({
+      id: "superchat-1",
+      timestamp: 1_752_688_101_500,
+      body: { user, content: "这是一条醒目留言", price: 30 },
+    });
     connection.handler.onGift({
       id: "gift-1",
       timestamp: 1_752_688_102_000,
@@ -548,9 +553,16 @@ describe("administration and ingestion", () => {
     const danmaku = await request(app).get(`/api/sessions/${session.id}/danmaku?q=${encodeURIComponent("WebSocket 采集成功")}`).expect(200);
     assert.equal(danmaku.body.total, 1);
     assert.equal(danmaku.body.items[0].avatar_url, "https://i0.hdslb.com/bfs/face/raw-avatar.jpg");
+    const superchats = await request(app).get(`/api/sessions/${session.id}/danmaku?superchat=only`).expect(200);
+    assert.equal(superchats.body.total, 1);
+    assert.equal(superchats.body.items[0].content, "这是一条醒目留言");
+    assert.equal(superchats.body.items[0].is_superchat, 1);
+    assert.equal(superchats.body.items[0].superchat_price, 30);
+    const withoutSuperchats = await request(app).get(`/api/sessions/${session.id}/danmaku?superchat=exclude`).expect(200);
+    assert.ok(withoutSuperchats.body.items.every((item) => item.is_superchat === 0));
     const viewers = await request(app).get(`/api/sessions/${session.id}/viewers?q=${encodeURIComponent("采集测试观众")}`).expect(200);
     assert.equal(viewers.body.total, 1);
-    assert.equal(viewers.body.items[0].message_count, 1);
+    assert.equal(viewers.body.items[0].message_count, 2);
     assert.equal(viewers.body.items[0].entry_count, 1);
     assert.equal(viewers.body.items[0].first_entered_at, new Date(1_752_688_100_000).toISOString());
     assert.equal(viewers.body.items[0].last_entered_at, new Date(1_752_688_100_000).toISOString());
@@ -558,6 +570,7 @@ describe("administration and ingestion", () => {
     assert.equal(gifts.body.gifts.find((item) => item.gift_name === "小花花").total_value, 2);
     assert.equal(gifts.body.gifts.find((item) => item.gift_name === "舰长").total_value, 138);
     assert.equal(gifts.body.gifts.find((item) => item.gift_name === "小心心").total_value, 0.1);
+    assert.equal(gifts.body.gifts.find((item) => item.gift_name === "醒目留言").total_value, 30);
     assert.equal(gifts.body.history.find((item) => item.gift_name === "小花花").gift_icon_url, "https://s1.hdslb.com/bfs/live/gift-small-flower.png");
     assert.equal(gifts.body.history.find((item) => item.gift_name === "舰长").username, "上舰测试观众");
     assert.equal(gifts.body.history.find((item) => item.gift_name === "小心心").username, "一电池测试观众");
@@ -565,7 +578,7 @@ describe("administration and ingestion", () => {
     const monitor = await agent.get("/api/admin/monitor").expect(200);
     const status = monitor.body.danmaku.rooms.find((item) => item.room_number === "7788");
     assert.equal(status.status, "listening");
-    assert.equal(status.message_count, 5);
+    assert.equal(status.message_count, 7);
 
     connection.handler.onClose();
     const closedMonitor = await agent.get("/api/admin/monitor").expect(200);
@@ -578,7 +591,7 @@ describe("administration and ingestion", () => {
     const recoveredStatus = recoveredMonitor.body.danmaku.rooms.find((item) => item.room_number === "7788");
     assert.equal(recoveredStatus.status, "listening");
     assert.equal(recoveredStatus.last_error, "");
-    assert.equal(recoveredStatus.message_count, 6);
+    assert.equal(recoveredStatus.message_count, 8);
 
     const missingAvatarUser = { uid: 889900, uname: "等待头像补全", face: "", identity: { guard_level: 0 } };
     profileResponse = [{ uid: "889900", username: "头像已补全", avatar_url: "https://i1.hdslb.com/bfs/face/enriched.jpg" }];

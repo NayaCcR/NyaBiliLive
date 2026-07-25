@@ -429,6 +429,8 @@ export class DanmakuCollector {
           content: body.content,
           medal_name: body.user?.badge?.name || "",
           medal_level: Number(body.user?.badge?.level || 0),
+          is_superchat: true,
+          superchat_price: Number(body.price || 0),
         });
         ingest({
           type: "gift",

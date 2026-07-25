@@ -431,12 +431,14 @@ export function createApp({
     const limit = parsePositiveInt(request.query.limit, config.value.display.danmaku_page_size, 200);
     const offset = parsePositiveInt(request.query.offset, 0);
     const order = parseOption(request.query.order, ["asc", "desc"], "desc", "排序方向");
+    const superchat = parseOption(request.query.superchat, ["all", "only", "exclude"], "all", "SC 筛选");
     const session = database.getSession(Number(request.params.id));
     response.json(database.listDanmaku(Number(request.params.id), {
       query: String(request.query.q || "").trim(),
       limit,
       offset,
       order,
+      superchat,
       includeNotes: canAccessRoomProtectedData(request, session?.room_id),
     }));
   });

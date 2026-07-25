@@ -72,6 +72,8 @@ CREATE TABLE IF NOT EXISTS danmaku (
   content TEXT NOT NULL,
   medal_name TEXT NOT NULL DEFAULT '',
   medal_level INTEGER NOT NULL DEFAULT 0,
+  is_superchat INTEGER NOT NULL DEFAULT 0,
+  superchat_price REAL NOT NULL DEFAULT 0,
   sent_at TEXT NOT NULL
 );
 
@@ -156,6 +158,28 @@ export class ArchiveDatabase {
     for (const [name, definition] of additions) {
       if (!roomColumns.has(name)) this.db.exec(`ALTER TABLE rooms ADD COLUMN ${name} ${definition}`);
     }
+    const danmakuColumns = new Set(this.db.prepare("PRAGMA table_info(danmaku)").all().map((column) => column.name));
+    const needsSuperchatBackfill = !danmakuColumns.has("is_superchat") || !danmakuColumns.has("superchat_price");
+    if (!danmakuColumns.has("is_superchat")) this.db.exec("ALTER TABLE danmaku ADD COLUMN is_superchat INTEGER NOT NULL DEFAULT 0");
+    if (!danmakuColumns.has("superchat_price")) this.db.exec("ALTER TABLE danmaku ADD COLUMN superchat_price REAL NOT NULL DEFAULT 0");
+    if (needsSuperchatBackfill) this.db.exec(`
+      UPDATE danmaku
+      SET is_superchat = 1,
+        superchat_price = COALESCE((
+          SELECT MAX(g.unit_price) FROM gifts g
+          WHERE g.session_id = danmaku.session_id
+            AND g.user_id = danmaku.user_id
+            AND g.gift_name = '醒目留言'
+            AND g.received_at = danmaku.sent_at
+        ), 0)
+      WHERE is_superchat = 0 AND EXISTS (
+        SELECT 1 FROM gifts g
+        WHERE g.session_id = danmaku.session_id
+          AND g.user_id = danmaku.user_id
+          AND g.gift_name = '醒目留言'
+          AND g.received_at = danmaku.sent_at
+      )
+    `);
     const keyInUse = this.db.prepare("SELECT 1 FROM rooms WHERE claim_key = ? AND id != ?").pluck();
     const updateClaimKey = this.db.prepare("UPDATE rooms SET claim_key = ?, updated_at = ? WHERE id = ?");
     for (const row of this.db.prepare("SELECT id FROM rooms WHERE claim_key = '' OR claim_key IS NULL").all()) {
@@ -237,8 +261,10 @@ export class ArchiveDatabase {
           entry_count = session_users.entry_count + 1
       `),
       insertDanmaku: this.db.prepare(`
-        INSERT INTO danmaku (session_id, user_id, content, medal_name, medal_level, sent_at)
-        VALUES (@session_id, @user_id, @content, @medal_name, @medal_level, @timestamp)
+        INSERT INTO danmaku
+          (session_id, user_id, content, medal_name, medal_level, is_superchat, superchat_price, sent_at)
+        VALUES
+          (@session_id, @user_id, @content, @medal_name, @medal_level, @is_superchat, @superchat_price, @timestamp)
       `),
       incrementMessage: this.db.prepare(`
         UPDATE session_users SET message_count = message_count + 1
@@ -293,7 +319,12 @@ export class ArchiveDatabase {
       }
       this.statements.ensureSessionUser.run(common);
       if (event.type === "danmaku") {
-        const result = this.statements.insertDanmaku.run({ ...common, ...event });
+        const result = this.statements.insertDanmaku.run({
+          ...common,
+          ...event,
+          is_superchat: Number(Boolean(event.is_superchat)),
+          superchat_price: Number(event.superchat_price || 0),
+        });
         this.statements.incrementMessage.run(common);
         return { id: Number(result.lastInsertRowid), type: "danmaku" };
       }
@@ -448,13 +479,14 @@ export class ArchiveDatabase {
     return { ...session, stats };
   }
 
-  listDanmaku(sessionId, { query = "", limit = 50, offset = 0, order = "desc", includeNotes = false } = {}) {
+  listDanmaku(sessionId, { query = "", limit = 50, offset = 0, order = "desc", superchat = "all", includeNotes = false } = {}) {
     const search = query ? "AND (d.content LIKE @needle OR u.username LIKE @needle OR u.bili_uid LIKE @needle)" : "";
+    const superchatFilter = superchat === "only" ? "AND d.is_superchat = 1" : superchat === "exclude" ? "AND d.is_superchat = 0" : "";
     const params = { sessionId, needle: `%${query}%`, limit, offset };
     const direction = order === "asc" ? "ASC" : "DESC";
     const total = this.db.prepare(`
       SELECT COUNT(*) AS count FROM danmaku d JOIN users u ON u.id = d.user_id
-      WHERE d.session_id = @sessionId ${search}
+      WHERE d.session_id = @sessionId ${search} ${superchatFilter}
     `).get(params).count;
     const items = this.db.prepare(`
       SELECT d.*, u.bili_uid, u.username, u.avatar_url, u.guard_level, COALESCE(run.note, '') AS room_note
@@ -462,10 +494,10 @@ export class ArchiveDatabase {
       JOIN users u ON u.id = d.user_id
       JOIN live_sessions s ON s.id = d.session_id
       LEFT JOIN room_user_notes run ON run.room_id = s.room_id AND run.user_id = d.user_id
-      WHERE d.session_id = @sessionId ${search}
+      WHERE d.session_id = @sessionId ${search} ${superchatFilter}
       ORDER BY d.sent_at ${direction}, d.id ${direction} LIMIT @limit OFFSET @offset
     `).all(params).map((item) => ({ ...item, room_note: includeNotes ? item.room_note : "" }));
-    return { items, total, limit, offset, order };
+    return { items, total, limit, offset, order, superchat };
   }
 
   giftReport(sessionId, { includeNotes = false } = {}) {
@@ -742,10 +774,19 @@ export class ArchiveDatabase {
         [[0, "醒目留言", 1, 50], [2, "小花花", 12, 1], [4, "打call", 5, 6], [1, "牛哇牛哇", 3, 5]]
           .forEach(([userIndex, giftName, count, unitPrice], giftIndex) => {
             const [uid, username, guardLevel] = users[userIndex];
+            const timestamp = new Date(current - (110 - giftIndex * 13 + sessionIndex * 4000) * 60_000).toISOString();
+            const user = { uid, username, guard_level: guardLevel, avatar_url: "" };
+            if (giftName === "醒目留言") {
+              this.ingest({
+                type: "danmaku", session_id: session.id, user, timestamp,
+                content: "谢谢你的直播", medal_name: "Nya团", medal_level: 18,
+                is_superchat: true, superchat_price: unitPrice,
+              });
+            }
             this.ingest({ type: "gift", session_id: session.id,
-              user: { uid, username, guard_level: guardLevel, avatar_url: "" }, gift_name: giftName,
+              user, gift_name: giftName,
               gift_icon_url: "", count, unit_price: unitPrice, trade_id: `demo-${session.id}-${giftIndex}`,
-              timestamp: new Date(current - (110 - giftIndex * 13 + sessionIndex * 4000) * 60_000).toISOString() });
+              timestamp });
           });
       });
     });

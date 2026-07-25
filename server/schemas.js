@@ -93,6 +93,8 @@ export const ingestEventSchema = z.discriminatedUnion("type", [
     content: requiredText.max(500),
     medal_name: z.string().trim().max(50).default(""),
     medal_level: z.coerce.number().int().min(0).default(0),
+    is_superchat: z.boolean().default(false),
+    superchat_price: z.coerce.number().min(0).default(0),
   }),
   baseEventSchema.extend({
     type: z.literal("gift"),
