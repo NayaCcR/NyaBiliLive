@@ -154,7 +154,26 @@ beforeEach(() => {
       },
     },
     danmakuListenerFactory(roomNumber, handler, options) {
-      const instance = { roomNumber, handler, options, closed: false, heartbeatCount: 0, close() { this.closed = true; }, heartbeat() { this.heartbeatCount += 1; } };
+      const liveHandlers = new Map();
+      const instance = {
+        roomNumber,
+        handler,
+        options,
+        closed: false,
+        heartbeatCount: 0,
+        live: {
+          on(eventName, listener) {
+            const listeners = liveHandlers.get(eventName) || [];
+            listeners.push(listener);
+            liveHandlers.set(eventName, listeners);
+          },
+        },
+        emitLiveMessage(packet) {
+          for (const listener of liveHandlers.get("msg") || []) listener(packet);
+        },
+        close() { this.closed = true; },
+        heartbeat() { this.heartbeatCount += 1; },
+      };
       danmakuConnections.push(instance);
       return instance;
     },
@@ -363,6 +382,8 @@ describe("public archive", () => {
     assert.equal(gifts.body.history.length, gifts.body.history_total);
     assert.ok(gifts.body.history.every((item) => item.username && item.gift_name));
     assert.ok(gifts.body.history.every((item, index, items) => index === 0 || items[index - 1].received_at >= item.received_at));
+    assert.ok(gifts.body.ranking.every((item) => item.first_gift_at && item.last_gift_at && item.first_gift_at <= item.last_gift_at));
+    assert.ok(gifts.body.gifts.every((item) => item.first_gift_at && item.last_gift_at && item.first_gift_at <= item.last_gift_at));
   });
 
   test("claims a live room only through configured manager UID danmaku and persists it in cookies", async () => {
@@ -1022,8 +1043,9 @@ describe("administration and ingestion", () => {
       timestamp: 1_752_688_104_000,
       coin_type: "gold",
     });
-    connection.handler.raw.SEND_GIFT_V2({
-      pb: encodeGiftV2Payload({
+    connection.emitLiveMessage({ data: {
+      cmd: "SEND_GIFT_V2",
+      data: { pb: encodeGiftV2Payload({
         uid: 10210001,
         uname: "1021Official",
         face: "https://i0.hdslb.com/bfs/face/gift-v2-avatar.jpg",
@@ -1036,8 +1058,8 @@ describe("administration and ingestion", () => {
           tid: "gift-v2-popularity-ticket",
           icon: "https://s1.hdslb.com/bfs/live/popularity-ticket.png",
         }],
-      }),
-    });
+      }) },
+    } });
     connection.handler.onGift({
       id: "legacy-copy-of-gift-v2",
       timestamp: 1_752_688_105_000,
@@ -1084,6 +1106,12 @@ describe("administration and ingestion", () => {
     const status = monitor.body.danmaku.rooms.find((item) => item.room_number === "7788");
     assert.equal(status.status, "listening");
     assert.equal(status.message_count, 8);
+    assert.equal(status.gift_v2_received_count, 1);
+    assert.equal(status.gift_v2_decoded_count, 1);
+    assert.equal(status.gift_v2_ingested_count, 1);
+    assert.equal(status.gift_v2_duplicate_count, 0);
+    assert.ok(status.gift_v2_last_at);
+    assert.equal(status.gift_v2_last_error, "");
     assert.equal(status.heartbeat_status, "healthy");
     assert.ok(status.last_heartbeat_at);
 

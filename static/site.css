@@ -201,18 +201,20 @@ a { color: inherit; }
 .data-title { min-height: 44px; margin-bottom: 10px; }
 .data-title > span, .surface-heading p { margin: 4px 0 0; color: var(--muted-foreground); font-size: 10px; }
 .ranking-list, .gift-list, .danmaku-list { border-top: 1px solid var(--border); }
-.ranking-row { min-height: 66px; display: grid; grid-template-columns: 24px 34px minmax(0, 1fr) auto; align-items: center; gap: 10px; border-bottom: 1px solid var(--border); }
+.ranking-row { min-height: 82px; display: grid; grid-template-columns: 24px 34px minmax(0, 1fr) auto; align-items: center; gap: 10px; border-bottom: 1px solid var(--border); }
 .ranking-row > b { color: var(--muted-foreground); font-size: 11px; }
 .ranking-row > span, .gift-row > span:nth-child(2) { min-width: 0; display: grid; gap: 3px; }
 .ranking-row strong, .gift-row strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
 .ranking-row small, .gift-row small { color: var(--muted-foreground); font-size: 9px; }
+.gift-time-range { display: flex; flex-wrap: wrap; gap: 2px 9px; line-height: 1.45; }
+.gift-time-range time { white-space: nowrap; }
 .ranking-row em, .gift-row em { color: var(--primary); font-size: 11px; font-style: normal; font-weight: 700; }
 .user-avatar { width: 34px; height: 34px; flex: 0 0 34px; display: grid; place-items: center; overflow: hidden; border-radius: 50%; background: var(--muted); color: var(--muted-foreground); font-size: 9px; font-weight: 700; }
 .user-avatar[href] { text-decoration: none; transition: box-shadow .15s, transform .15s; }
 .user-avatar[href]:hover { box-shadow: 0 0 0 3px var(--primary-soft); transform: translateY(-1px); }
 .user-avatar > * { grid-area: 1 / 1; }
 .user-avatar img { position: relative; z-index: 1; width: 100%; height: 100%; background: var(--muted); object-fit: cover; }
-.gift-row { min-height: 66px; display: grid; grid-template-columns: 36px minmax(0, 1fr) auto; align-items: center; gap: 10px; border-bottom: 1px solid var(--border); }
+.gift-row { min-height: 82px; display: grid; grid-template-columns: 36px minmax(0, 1fr) auto; align-items: center; gap: 10px; border-bottom: 1px solid var(--border); }
 .gift-icon { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 7px; background: var(--primary-soft); color: var(--primary); font-size: 9px; font-weight: 800; }
 .gift-history-section { margin-top: 28px; }
 .gift-history-page { margin-top: 0; }
@@ -266,6 +268,7 @@ a { color: inherit; }
 .personal-gift-summary > header > span { min-width: 0; display: grid; gap: 3px; }
 .personal-gift-summary > header strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .personal-gift-summary > header small { color: var(--muted-foreground); font-size: 9px; }
+.personal-gift-times { display: grid; gap: 2px; line-height: 1.4; }
 .personal-gift-summary > div { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-left: 1px solid var(--border); }
 .personal-gift-summary > div > span { min-width: 0; padding: 9px 14px; display: grid; gap: 5px; border-right: 1px solid var(--border); }
 .personal-gift-summary > div small { color: var(--muted-foreground); font-size: 8px; }

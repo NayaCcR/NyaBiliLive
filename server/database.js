@@ -679,7 +679,8 @@ export class ArchiveDatabase {
   giftReport(sessionId, { includeNotes = false } = {}) {
     const ranking = this.db.prepare(`
       SELECT u.bili_uid, u.username, u.avatar_url, u.guard_level, COALESCE(run.note, '') AS room_note,
-        SUM(g.total_value) AS total_value, SUM(g.count) AS gift_count, COUNT(g.id) AS send_count
+        SUM(g.total_value) AS total_value, SUM(g.count) AS gift_count, COUNT(g.id) AS send_count,
+        MIN(g.received_at) AS first_gift_at, MAX(g.received_at) AS last_gift_at
       FROM gifts g
       JOIN users u ON u.id = g.user_id
       JOIN live_sessions s ON s.id = g.session_id
@@ -689,7 +690,8 @@ export class ArchiveDatabase {
     `).all(sessionId).map((item) => ({ ...item, room_note: includeNotes ? item.room_note : "" }));
     const gifts = this.db.prepare(`
       SELECT g.gift_name, g.gift_icon_url, SUM(g.count) AS count,
-        SUM(g.total_value) AS total_value, MAX(g.unit_price) AS unit_price
+        SUM(g.total_value) AS total_value, MAX(g.unit_price) AS unit_price,
+        MIN(g.received_at) AS first_gift_at, MAX(g.received_at) AS last_gift_at
       FROM gifts g WHERE g.session_id = ? GROUP BY g.gift_name, g.gift_icon_url
       ORDER BY total_value DESC, count DESC
     `).all(sessionId);

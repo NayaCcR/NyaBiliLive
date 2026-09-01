@@ -234,6 +234,12 @@ export class DanmakuCollector {
         last_recovery_at: connection.lastRecoveryAt,
         last_recovery_reason: connection.lastRecoveryReason,
         message_count: connection.messageCount,
+        gift_v2_received_count: connection.giftV2ReceivedCount,
+        gift_v2_decoded_count: connection.giftV2DecodedCount,
+        gift_v2_ingested_count: connection.giftV2IngestedCount,
+        gift_v2_duplicate_count: connection.giftV2DuplicateCount,
+        gift_v2_last_at: connection.giftV2LastAt,
+        gift_v2_last_error: connection.giftV2LastError,
         last_error: connection.lastError,
         retry_at: connection.retryAt ? new Date(connection.retryAt).toISOString() : null,
       })),
@@ -463,6 +469,12 @@ export class DanmakuCollector {
       lastRecoveryAt: recovery.at,
       lastRecoveryReason: recovery.reason,
       messageCount: 0,
+      giftV2ReceivedCount: 0,
+      giftV2DecodedCount: 0,
+      giftV2IngestedCount: 0,
+      giftV2DuplicateCount: 0,
+      giftV2LastAt: null,
+      giftV2LastError: "",
       lastError: "",
       handshakeTimer: null,
       retryAt: null,
@@ -520,7 +532,7 @@ export class DanmakuCollector {
       return session;
     };
     const ingest = (event) => {
-      if (!isCurrent()) return;
+      if (!isCurrent()) return false;
       try {
         const session = this.database.getActiveSessionForRoom(room.id);
         const matchedUid = String(event.user?.uid || "").startsWith("guest:")
@@ -532,9 +544,68 @@ export class DanmakuCollector {
         this.queueUserProfile(user);
         connection.sessionId = session?.id || null;
         recordEvent();
+        return true;
       } catch (error) {
         reportError(error);
+        return false;
       }
+    };
+    const handleSendGiftV2 = (raw) => {
+      if (!isCurrent()) return;
+      connection.giftV2ReceivedCount += 1;
+      connection.giftV2LastAt = new Date().toISOString();
+      connection.giftV2LastError = "";
+      let gifts;
+      try {
+        gifts = decodeSendGiftV2(raw?.pb);
+      } catch (error) {
+        connection.giftV2LastError = error instanceof Error ? error.message : String(error);
+        this.logger.warn?.(`[danmaku] invalid SEND_GIFT_V2 payload in room ${room.room_number}: ${connection.giftV2LastError}`);
+        return;
+      }
+      connection.giftV2DecodedCount += gifts.length;
+      let ingestedCount = 0;
+      gifts.forEach((gift, index) => {
+        const stableId = gift.tid || gift.rnd;
+        const syntheticMessage = {
+          id: stableId || "",
+          timestamp: gift.timestamp || Date.now(),
+          body: {
+            user: {
+              uid: gift.uid,
+              uname: gift.uname,
+              face: gift.face,
+              identity: { guard_level: gift.guard_level },
+            },
+            gift_name: gift.gift_name,
+            amount: gift.num,
+            coin_type: gift.coin_type,
+            price: gift.price,
+            timestamp: gift.timestamp,
+          },
+          raw: gift,
+        };
+        // Use the legacy prefix as well so a gray-release room emitting both formats is not double-counted.
+        const tradeId = stableId ? giftTradeId("gift", syntheticMessage, syntheticMessage.body, gift) : "";
+        if (!rememberGiftTrade(tradeId)) {
+          connection.giftV2DuplicateCount += 1;
+          return;
+        }
+        const resolvedGiftName = giftName(syntheticMessage.body, gift);
+        if (!resolvedGiftName) return;
+        if (ingest({
+          type: "gift",
+          timestamp: giftTimestamp(syntheticMessage, syntheticMessage.body, gift),
+          user: normalizeGiftUser(syntheticMessage, syntheticMessage.body, gift, `gift-v2-${index}`),
+          gift_name: resolvedGiftName,
+          gift_icon_url: messageGiftIcon(syntheticMessage, syntheticMessage.body, gift),
+          count: giftCount(syntheticMessage.body, gift),
+          unit_price: giftUnitPrice(syntheticMessage.body, gift),
+          trade_id: tradeId,
+        })) ingestedCount += 1;
+      });
+      connection.giftV2IngestedCount += ingestedCount;
+      this.logger.info?.(`[danmaku] gift-v2 room ${room.room_number}: decoded ${gifts.length}, ingested ${ingestedCount}`);
     };
     const handler = {
       onOpen: () => { if (!isCurrent()) return; connection.status = "connected"; connection.connectedAt = new Date().toISOString(); connection.lastError = ""; this.cancelPendingRecovery(connection); },
@@ -659,51 +730,7 @@ export class DanmakuCollector {
         this.cancelPendingRecovery(connection);
       },
       raw: {
-        SEND_GIFT_V2: (raw) => {
-          let gifts;
-          try {
-            gifts = decodeSendGiftV2(raw?.pb);
-          } catch (error) {
-            this.logger.warn?.(`[danmaku] invalid SEND_GIFT_V2 payload in room ${room.room_number}: ${error.message}`);
-            return;
-          }
-          gifts.forEach((gift, index) => {
-            const stableId = gift.tid || gift.rnd;
-            const syntheticMessage = {
-              id: stableId || "",
-              timestamp: gift.timestamp || Date.now(),
-              body: {
-                user: {
-                  uid: gift.uid,
-                  uname: gift.uname,
-                  face: gift.face,
-                  identity: { guard_level: gift.guard_level },
-                },
-                gift_name: gift.gift_name,
-                amount: gift.num,
-                coin_type: gift.coin_type,
-                price: gift.price,
-                timestamp: gift.timestamp,
-              },
-              raw: gift,
-            };
-            // Use the legacy prefix as well so a gray-release room emitting both formats is not double-counted.
-            const tradeId = stableId ? giftTradeId("gift", syntheticMessage, syntheticMessage.body, gift) : "";
-            if (!rememberGiftTrade(tradeId)) return;
-            const resolvedGiftName = giftName(syntheticMessage.body, gift);
-            if (!resolvedGiftName) return;
-            ingest({
-              type: "gift",
-              timestamp: giftTimestamp(syntheticMessage, syntheticMessage.body, gift),
-              user: normalizeGiftUser(syntheticMessage, syntheticMessage.body, gift, `gift-v2-${index}`),
-              gift_name: resolvedGiftName,
-              gift_icon_url: messageGiftIcon(syntheticMessage, syntheticMessage.body, gift),
-              count: giftCount(syntheticMessage.body, gift),
-              unit_price: giftUnitPrice(syntheticMessage.body, gift),
-              trade_id: tradeId,
-            });
-          });
-        },
+        SEND_GIFT_V2: handleSendGiftV2,
         COMBO_SEND: (raw) => {
           const syntheticMessage = { id: raw.combo_id || raw.batch_combo_id || raw.rnd || "combo", timestamp: raw.timestamp || raw.tid || Date.now(), body: {}, raw };
           const tradeId = giftTradeId("gift", syntheticMessage, syntheticMessage.body, raw);
@@ -737,6 +764,13 @@ export class DanmakuCollector {
             ...(cookie ? { Cookie: cookie } : {}),
           },
         },
+      });
+      // blive-message-listener 0.5.5 does not emit unknown V2 commands through its
+      // named raw handler even though they are visible on the underlying message stream.
+      connection.instance.live?.on?.("msg", (packet) => {
+        const command = String(packet?.data?.cmd || packet?.cmd || "").split(":")[0];
+        if (command !== "SEND_GIFT_V2") return;
+        handleSendGiftV2(packet?.data?.data ?? packet?.data ?? {});
       });
       connection.handshakeTimer = setTimeout(() => reportError(
         new Error("弹幕握手超时；Bilibili 可能触发 -352 风控，请尝试在管理后台配置浏览器 Cookie"),
