@@ -526,6 +526,8 @@ export class ArchiveDatabase {
     const ensure = this.db.transaction(() => {
       const room = this.getRoomById(Number(roomId));
       if (!room || !Number(room.enabled)) return null;
+      this.db.prepare("UPDATE rooms SET live_status = 1, updated_at = ? WHERE id = ?")
+        .run(startedAt || now(), room.id);
       const activeSession = this.getActiveSessionForRoom(room.id);
       if (activeSession) return activeSession;
       return this.createSession(room.id, {
@@ -731,18 +733,20 @@ export class ArchiveDatabase {
     return { items, total, min_messages: minMessages, limit, offset, sort_by: sortBy, order };
   }
 
-  waitingEventReport(sessionId, { includeNotes = false } = {}) {
-    const session = this.getSession(Number(sessionId));
-    if (!session) return null;
+  buildWaitingEventReport(roomId, sessionId, { includeNotes = false } = {}) {
     const note = includeNotes ? "COALESCE(run.note, '')" : "''";
+    const scope = sessionId === null
+      ? "we.room_id = @roomId AND we.session_id IS NULL"
+      : "we.session_id = @sessionId";
+    const params = { roomId: Number(roomId), sessionId };
     const counts = this.db.prepare(`
       SELECT
-        SUM(CASE WHEN event_type = 'gift' THEN 1 ELSE 0 END) AS gift_count,
-        SUM(CASE WHEN event_type = 'danmaku' THEN 1 ELSE 0 END) AS danmaku_count,
-        SUM(CASE WHEN event_type = 'enter' THEN 1 ELSE 0 END) AS entry_count,
-        COUNT(DISTINCT user_id) AS user_count
-      FROM waiting_events WHERE session_id = ?
-    `).get(session.id);
+        SUM(CASE WHEN we.event_type = 'gift' THEN 1 ELSE 0 END) AS gift_count,
+        SUM(CASE WHEN we.event_type = 'danmaku' THEN 1 ELSE 0 END) AS danmaku_count,
+        SUM(CASE WHEN we.event_type = 'enter' THEN 1 ELSE 0 END) AS entry_count,
+        COUNT(DISTINCT we.user_id) AS user_count
+      FROM waiting_events we WHERE ${scope}
+    `).get(params);
     const danmaku = this.db.prepare(`
       SELECT we.id, we.content, we.medal_name, we.medal_level, we.is_superchat,
         we.superchat_price, we.occurred_at AS sent_at, u.bili_uid, u.username,
@@ -750,9 +754,9 @@ export class ArchiveDatabase {
       FROM waiting_events we
       JOIN users u ON u.id = we.user_id
       LEFT JOIN room_user_notes run ON run.room_id = we.room_id AND run.user_id = we.user_id
-      WHERE we.session_id = ? AND we.event_type = 'danmaku'
+      WHERE ${scope} AND we.event_type = 'danmaku'
       ORDER BY we.occurred_at ASC, we.id ASC
-    `).all(session.id);
+    `).all(params);
     const gifts = this.db.prepare(`
       SELECT we.id, we.gift_name, we.gift_icon_url, we.gift_count AS count,
         we.unit_price, we.total_value, we.trade_id, we.occurred_at AS received_at,
@@ -760,9 +764,9 @@ export class ArchiveDatabase {
       FROM waiting_events we
       JOIN users u ON u.id = we.user_id
       LEFT JOIN room_user_notes run ON run.room_id = we.room_id AND run.user_id = we.user_id
-      WHERE we.session_id = ? AND we.event_type = 'gift'
+      WHERE ${scope} AND we.event_type = 'gift'
       ORDER BY we.occurred_at ASC, we.id ASC
-    `).all(session.id);
+    `).all(params);
     const viewers = this.db.prepare(`
       SELECT u.bili_uid, u.username, u.avatar_url, u.guard_level, ${note} AS room_note,
         MIN(we.occurred_at) AS first_entered_at,
@@ -773,17 +777,31 @@ export class ArchiveDatabase {
       FROM waiting_events we
       JOIN users u ON u.id = we.user_id
       LEFT JOIN room_user_notes run ON run.room_id = we.room_id AND run.user_id = we.user_id
-      WHERE we.session_id = ?
+      WHERE ${scope}
       GROUP BY we.user_id
       ORDER BY first_entered_at ASC, we.user_id ASC
-    `).all(session.id);
+    `).all(params);
     return {
-      session_id: session.id,
+      room_id: Number(roomId),
+      session_id: sessionId,
+      pending: sessionId === null,
       counts: Object.fromEntries(Object.entries(counts).map(([key, value]) => [key, Number(value || 0)])),
       gifts,
       danmaku,
       viewers,
     };
+  }
+
+  currentWaitingEventReport(roomId, options = {}) {
+    const room = this.getRoomById(Number(roomId));
+    if (!room) return null;
+    return this.buildWaitingEventReport(room.id, null, options);
+  }
+
+  waitingEventReport(sessionId, options = {}) {
+    const session = this.getSession(Number(sessionId));
+    if (!session) return null;
+    return this.buildWaitingEventReport(session.room_id, session.id, options);
   }
 
   importSupplementEvents(sessionId, items) {

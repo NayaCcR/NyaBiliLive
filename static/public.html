@@ -47,12 +47,13 @@
     </section>
 
     <section class="archive-section">
-      <header class="section-title-row"><div><p class="kicker">SESSION ARCHIVE</p><h2>场次记录</h2></div><div class="archive-controls"><button type="button" id="session-prev" aria-label="向前浏览">←</button><button type="button" id="session-next" aria-label="向后浏览">→</button></div></header>
+      <header class="section-title-row"><div><p class="kicker">SESSION ARCHIVE</p><nav class="archive-view-tabs" aria-label="归档视图"><button type="button" class="active" data-archive-view="sessions">场次记录</button><button type="button" data-archive-view="waiting">候场记录</button></nav></div><div class="archive-controls"><button type="button" id="session-prev" aria-label="向前浏览">←</button><button type="button" id="session-next" aria-label="向后浏览">→</button></div></header>
       <div class="session-strip" id="session-strip"></div>
+      <section class="current-waiting-section" id="current-waiting" hidden></section>
     </section>
 
     <section class="records-section" id="selected-session">
-      <nav class="record-tabs" aria-label="记录类型"><button type="button" class="tab active" data-tab="gifts">打赏与礼物</button><button type="button" class="tab" data-tab="danmaku">弹幕历史</button><button type="button" class="tab" data-tab="viewers">进房用户</button><button type="button" class="tab" data-tab="waiting">候场事件</button></nav>
+      <nav class="record-tabs" aria-label="记录类型"><button type="button" class="tab active" data-tab="gifts">打赏与礼物</button><button type="button" class="tab" data-tab="danmaku">弹幕历史</button><button type="button" class="tab" data-tab="viewers">进房用户</button><button type="button" class="tab" data-tab="waiting">候场归档</button></nav>
       <div class="tab-panel" id="panel-gifts"></div><div class="tab-panel" id="panel-danmaku" hidden></div><div class="tab-panel" id="panel-viewers" hidden></div><div class="tab-panel" id="panel-waiting" hidden></div>
     </section>
   </template>

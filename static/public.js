@@ -1,5 +1,5 @@
 const overviewCollapsed = (() => { try { return localStorage.getItem("nyabililive:overview-collapsed") === "true"; } catch { return false; } })();
-const state = { config: null, auth: null, authenticated: false, roomAuthenticated: false, room: null, session: null, activeTab: "gifts", danmakuOffset: 0, danmakuOrder: "desc", danmakuSuperchat: "all", viewerOffset: 0, viewerSort: "last_entered_at", viewerOrder: "desc", viewerData: null, viewerEditingUid: null, viewerNoteDraft: "", viewerNoteSavingUid: null, durationTimer: null, liveRefreshTimer: null, liveRefreshInFlight: false, liveRefreshGeneration: 0, danmakuRenderedOnce: false, danmakuSignature: "", viewerSignature: "", overviewCollapsed, giftData: null, giftSignature: "", giftMode: "overview", giftUserId: null, giftHistoryOrder: "desc", waitingMode: "gifts" };
+const state = { config: null, auth: null, authenticated: false, roomAuthenticated: false, room: null, session: null, activeTab: "gifts", archiveView: "sessions", danmakuOffset: 0, danmakuOrder: "desc", danmakuSuperchat: "all", viewerOffset: 0, viewerSort: "last_entered_at", viewerOrder: "desc", viewerData: null, viewerEditingUid: null, viewerNoteDraft: "", viewerNoteSavingUid: null, durationTimer: null, liveRefreshTimer: null, liveRefreshInFlight: false, liveRefreshGeneration: 0, currentWaitingRefreshTimer: null, currentWaitingRefreshInFlight: false, currentWaitingRefreshGeneration: 0, currentWaitingMode: "danmaku", danmakuRenderedOnce: false, danmakuSignature: "", viewerSignature: "", overviewCollapsed, giftData: null, giftSignature: "", giftMode: "overview", giftUserId: null, giftHistoryOrder: "desc", waitingMode: "gifts" };
 const app = document.querySelector("#app");
 const escapeHtml = (value = "") => String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;");
 const count = (value) => new Intl.NumberFormat("zh-CN").format(Number(value || 0));
@@ -88,6 +88,7 @@ function createRoomCard(room) {
 
 async function renderRoom(identifier) {
   stopLiveRefresh();
+  stopCurrentWaitingRefresh();
   state.room = await api(`/api/rooms/${encodeURIComponent(identifier)}`);
   state.roomAuthenticated = Boolean(
     state.auth?.auth_mode === "admin"
@@ -105,7 +106,10 @@ async function renderRoom(identifier) {
   }
   bindRoomEvents();
   renderSessionStrip();
+  const currentWaiting = await loadCurrentWaitingEvents();
+  if (!Number(currentWaiting.live_status)) startCurrentWaitingRefresh();
   if (state.room.sessions.length) await selectSession(state.room.sessions[0].id); else renderNoSessions();
+  applyArchiveView();
 }
 
 function bindRoomEvents() {
@@ -119,7 +123,20 @@ function bindRoomEvents() {
   document.querySelector("#refresh-room").addEventListener("click", refreshRoom);
   document.querySelector("#session-prev").addEventListener("click", () => document.querySelector("#session-strip").scrollBy({ left: -360, behavior: "smooth" }));
   document.querySelector("#session-next").addEventListener("click", () => document.querySelector("#session-strip").scrollBy({ left: 360, behavior: "smooth" }));
+  document.querySelectorAll("[data-archive-view]").forEach((button) => button.addEventListener("click", () => {
+    state.archiveView = button.dataset.archiveView;
+    applyArchiveView();
+  }));
   document.querySelectorAll(".tab").forEach((tab) => tab.addEventListener("click", () => switchTab(tab.dataset.tab)));
+}
+
+function applyArchiveView() {
+  const showSessions = state.archiveView === "sessions";
+  document.querySelectorAll("[data-archive-view]").forEach((button) => button.classList.toggle("active", button.dataset.archiveView === state.archiveView));
+  document.querySelector("#session-strip").hidden = !showSessions;
+  document.querySelector(".archive-controls").hidden = !showSessions;
+  document.querySelector("#selected-session").hidden = !showSessions || !state.room.sessions.length;
+  document.querySelector("#current-waiting").hidden = showSessions;
 }
 
 async function refreshRoom(event) {
@@ -244,7 +261,11 @@ async function refreshLiveSession(generation) {
     const summary = await api(`/api/sessions/${sessionId}/summary`);
     if (generation !== state.liveRefreshGeneration || state.session?.id !== sessionId) return;
     renderSessionSummary(summary);
-    if (summary.status !== "live" || summary.ended_at) { stopLiveRefresh(); return; }
+    if (summary.status !== "live" || summary.ended_at) {
+      stopLiveRefresh();
+      await renderRoom(identifierFromPath());
+      return;
+    }
     const panel = document.querySelector(`#panel-${state.activeTab}`);
     if (panel?.contains(document.activeElement)) return;
     if (state.activeTab === "gifts") {
@@ -330,8 +351,8 @@ function giftDataSignature(data) {
   return `${data.history_total ?? data.history?.length ?? 0}:${latest?.id ?? ""}:${latest?.received_at ?? ""}`;
 }
 
-function giftHistoryRows(items) {
-  return items.map((gift) => `<article class="gift-history-row">${userAvatar(gift)}<span>${usernameWithNote(gift)}<small>${escapeHtml(gift.gift_name)} × ${count(gift.count)}</small></span>${giftAmount(gift.total_value)}<time>${formatTimestamp(gift.received_at)}</time></article>`).join("") || '<div class="empty-inline">暂无礼物流水</div>';
+function giftHistoryRows(items, emptyText = "暂无礼物流水") {
+  return items.map((gift) => `<article class="gift-history-row">${userAvatar(gift)}<span>${usernameWithNote(gift)}<small>${escapeHtml(gift.gift_name)} × ${count(gift.count)}</small></span>${giftAmount(gift.total_value)}<time>${formatTimestamp(gift.received_at)}</time></article>`).join("") || `<div class="empty-inline">${escapeHtml(emptyText)}</div>`;
 }
 
 function orderedGiftHistory(items) {
@@ -463,12 +484,78 @@ async function loadViewers(reset = false, { silent = false, sessionId = state.se
   } catch (error) { panel.innerHTML = `<div class="empty-inline error">${escapeHtml(error.message)}</div>`; }
 }
 
-function waitingDanmakuRows(items) {
-  return items.map((item) => `<article class="danmaku-row${item.is_superchat ? " superchat" : ""}">${userAvatar(item)}<div><header>${usernameWithNote(item, { medal: item.medal_name ? `<span class="medal">${escapeHtml(item.medal_name)} ${item.medal_level}</span>` : "" })}<time>${formatTimestamp(item.sent_at)}</time></header><p>${escapeHtml(item.content)}</p>${item.is_superchat ? `<span class="superchat-batteries">${batteries(item.superchat_price)}</span>` : ""}</div></article>`).join("") || '<div class="empty-inline">本场直播前没有捕获到候场弹幕</div>';
+function waitingDanmakuRows(items, emptyText = "本场直播前没有捕获到候场弹幕") {
+  return items.map((item) => `<article class="danmaku-row${item.is_superchat ? " superchat" : ""}">${userAvatar(item)}<div><header>${usernameWithNote(item, { medal: item.medal_name ? `<span class="medal">${escapeHtml(item.medal_name)} ${item.medal_level}</span>` : "" })}<time>${formatTimestamp(item.sent_at)}</time></header><p>${escapeHtml(item.content)}</p>${item.is_superchat ? `<span class="superchat-batteries">${batteries(item.superchat_price)}</span>` : ""}</div></article>`).join("") || `<div class="empty-inline">${escapeHtml(emptyText)}</div>`;
 }
 
-function waitingViewerRows(items) {
-  return items.map((item) => `<tr><td><span class="user-cell">${userAvatar(item)}<span class="viewer-name-stack">${noteBadge(item)}<strong>${escapeHtml(item.username)}</strong></span></span></td><td class="viewer-uid-column"><span class="viewer-uid-value">${escapeHtml(item.bili_uid)}</span></td><td>${formatTimestamp(item.first_entered_at)}</td><td>${count(item.entry_count)}</td><td><strong>${count(item.message_count)}</strong></td><td>${count(item.event_count)}</td></tr>`).join("") || '<tr><td colspan="6" class="empty-cell">本场直播前没有捕获到候场用户</td></tr>';
+function waitingViewerRows(items, emptyText = "本场直播前没有捕获到候场用户") {
+  return items.map((item) => `<tr><td><span class="user-cell">${userAvatar(item)}<span class="viewer-name-stack">${noteBadge(item)}<strong>${escapeHtml(item.username)}</strong></span></span></td><td class="viewer-uid-column"><span class="viewer-uid-value">${escapeHtml(item.bili_uid)}</span></td><td>${formatTimestamp(item.first_entered_at)}</td><td>${count(item.entry_count)}</td><td><strong>${count(item.message_count)}</strong></td><td>${count(item.event_count)}</td></tr>`).join("") || `<tr><td colspan="6" class="empty-cell">${escapeHtml(emptyText)}</td></tr>`;
+}
+
+function stopCurrentWaitingRefresh() {
+  if (state.currentWaitingRefreshTimer) clearInterval(state.currentWaitingRefreshTimer);
+  state.currentWaitingRefreshTimer = null;
+  state.currentWaitingRefreshInFlight = false;
+  state.currentWaitingRefreshGeneration += 1;
+}
+
+function startCurrentWaitingRefresh() {
+  stopCurrentWaitingRefresh();
+  const generation = state.currentWaitingRefreshGeneration;
+  state.currentWaitingRefreshTimer = setInterval(() => refreshCurrentWaitingEvents(generation), 5000);
+}
+
+async function refreshCurrentWaitingEvents(generation) {
+  if (generation !== state.currentWaitingRefreshGeneration || document.hidden || state.currentWaitingRefreshInFlight || !state.room) return;
+  state.currentWaitingRefreshInFlight = true;
+  try {
+    const data = await loadCurrentWaitingEvents({ silent: true });
+    if (generation !== state.currentWaitingRefreshGeneration) return;
+    if (Number(data.live_status)) {
+      stopCurrentWaitingRefresh();
+      await renderRoom(identifierFromPath());
+    }
+  } catch {}
+  finally { if (generation === state.currentWaitingRefreshGeneration) state.currentWaitingRefreshInFlight = false; }
+}
+
+function renderCurrentWaitingEvents(data) {
+  const section = document.querySelector("#current-waiting");
+  if (!section) return;
+  const isLive = Number(data.live_status) === 1;
+  const monitored = Number(data.waiting_monitor_enabled) === 1;
+  const automaticTotal = data.counts.gift_count + data.counts.danmaku_count + data.counts.entry_count;
+  const views = {
+    gifts: `<section><header class="data-title"><div><p class="kicker">WAITING GIFTS</p><h3>候场礼物</h3></div><span>${count(data.counts.gift_count)} 条</span></header><div class="gift-history-list">${giftHistoryRows(data.gifts, "下一场还没有捕获到候场礼物")}</div></section>`,
+    danmaku: `<section><header class="data-title"><div><p class="kicker">WAITING DANMAKU</p><h3>候场弹幕</h3></div><span>${count(data.counts.danmaku_count)} 条</span></header><div class="danmaku-list">${waitingDanmakuRows(data.danmaku, "下一场还没有捕获到候场弹幕")}</div></section>`,
+    viewers: `<section><header class="data-title"><div><p class="kicker">WAITING AUDIENCE</p><h3>候场进房用户</h3></div><span>${count(data.counts.user_count)} 位</span></header><div class="table-wrap"><table><thead><tr><th>用户</th><th class="viewer-uid-column">UID</th><th>首次出现</th><th>进入</th><th>发言</th><th>事件</th></tr></thead><tbody>${waitingViewerRows(data.viewers, "下一场还没有捕获到候场用户")}</tbody></table></div></section>`,
+  };
+  const statusText = isLive ? "本场已开播" : monitored ? "候场监控中" : "候场监控已关闭";
+  const statusClass = isLive ? "archived" : monitored ? "monitoring" : "paused";
+  const summaryText = isLive ? "开播前的候场事件已归档到当前场次" : monitored ? "页面每 5 秒同步一次当前候场记录" : "已有记录仍会在下次开播时归档";
+  section.innerHTML = `<header class="current-waiting-heading"><div><p class="kicker">NEXT SESSION · WAITING ROOM</p><h2>下一场候场</h2><p>这些是尚未归入任何场次的临时记录；检测到开播后，会整体归档到新场次的“候场归档”。</p></div><span class="current-waiting-state ${statusClass}">${statusText}</span></header><div class="current-waiting-summary"><strong>${count(automaticTotal)}</strong><span>条待归档事件</span><small>${summaryText}</small></div><nav class="segmented-control waiting-event-tabs" aria-label="当前候场事件类型"><button type="button" data-current-waiting-mode="gifts" class="${state.currentWaitingMode === "gifts" ? "active" : ""}">礼物 ${count(data.counts.gift_count)}</button><button type="button" data-current-waiting-mode="danmaku" class="${state.currentWaitingMode === "danmaku" ? "active" : ""}">弹幕 ${count(data.counts.danmaku_count)}</button><button type="button" data-current-waiting-mode="viewers" class="${state.currentWaitingMode === "viewers" ? "active" : ""}">进房用户 ${count(data.counts.user_count)}</button></nav><div class="current-waiting-view">${views[state.currentWaitingMode] || views.danmaku}</div>`;
+  section.querySelectorAll("[data-current-waiting-mode]").forEach((button) => button.addEventListener("click", () => {
+    state.currentWaitingMode = button.dataset.currentWaitingMode;
+    renderCurrentWaitingEvents(data);
+  }));
+}
+
+async function loadCurrentWaitingEvents({ silent = false } = {}) {
+  const section = document.querySelector("#current-waiting");
+  if (!silent && section) {
+    section.innerHTML = '<div class="panel-loading">读取下一场候场记录…</div>';
+  }
+  try {
+    const roomId = state.room.id;
+    const identifier = state.room.alias || state.room.room_number;
+    const data = await api(`/api/rooms/${encodeURIComponent(identifier)}/waiting-events`);
+    if (Number(state.room?.id) !== Number(roomId)) return data;
+    renderCurrentWaitingEvents(data);
+    return data;
+  } catch (error) {
+    if (!silent && section) section.innerHTML = `<div class="empty-inline error">${escapeHtml(error.message)}</div>`;
+    throw error;
+  }
 }
 
 function decodeXmlEntities(value) {
@@ -600,7 +687,7 @@ function renderWaitingEvents(data, supplements) {
     viewers: `<section><header class="data-title"><div><p class="kicker">WAITING AUDIENCE</p><h3>候场进房用户</h3></div><span>${count(data.counts.user_count)} 位</span></header><div class="table-wrap"><table><thead><tr><th>用户</th><th class="viewer-uid-column">UID</th><th>首次出现</th><th>进入</th><th>发言</th><th>事件</th></tr></thead><tbody>${waitingViewerRows(data.viewers)}</tbody></table></div></section>`,
     supplements: supplementView(supplements),
   };
-  panel.innerHTML = `<div class="waiting-intro"><div><p class="kicker">PRE-LIVE ARCHIVE</p><h3>候场事件</h3><small>自动捕获的候场数据与手动补充的缺失记录都归在这里。</small></div><span>${count(data.counts.gift_count + data.counts.danmaku_count + data.counts.entry_count)} 条自动事件</span></div><nav class="segmented-control waiting-event-tabs" aria-label="候场事件类型"><button type="button" data-waiting-mode="gifts" class="${state.waitingMode === "gifts" ? "active" : ""}">礼物 ${count(data.counts.gift_count)}</button><button type="button" data-waiting-mode="danmaku" class="${state.waitingMode === "danmaku" ? "active" : ""}">弹幕 ${count(data.counts.danmaku_count)}</button><button type="button" data-waiting-mode="viewers" class="${state.waitingMode === "viewers" ? "active" : ""}">进房用户 ${count(data.counts.user_count)}</button><button type="button" data-waiting-mode="supplements" class="${state.waitingMode === "supplements" ? "active" : ""}">补充记录 ${count(supplements.total)}</button></nav><div class="waiting-event-view">${views[state.waitingMode] || views.gifts}</div>`;
+  panel.innerHTML = `<div class="waiting-intro"><div><p class="kicker">ARCHIVED WAITING</p><h3>本场候场归档</h3><small>这些自动事件原本位于房间的“下一场候场”，并在本场开播时归档；手动补充记录也保存在本场。</small></div><span>${count(data.counts.gift_count + data.counts.danmaku_count + data.counts.entry_count)} 条自动事件</span></div><nav class="segmented-control waiting-event-tabs" aria-label="候场归档类型"><button type="button" data-waiting-mode="gifts" class="${state.waitingMode === "gifts" ? "active" : ""}">礼物 ${count(data.counts.gift_count)}</button><button type="button" data-waiting-mode="danmaku" class="${state.waitingMode === "danmaku" ? "active" : ""}">弹幕 ${count(data.counts.danmaku_count)}</button><button type="button" data-waiting-mode="viewers" class="${state.waitingMode === "viewers" ? "active" : ""}">进房用户 ${count(data.counts.user_count)}</button><button type="button" data-waiting-mode="supplements" class="${state.waitingMode === "supplements" ? "active" : ""}">补充记录 ${count(supplements.total)}</button></nav><div class="waiting-event-view">${views[state.waitingMode] || views.gifts}</div>`;
   panel.querySelectorAll("[data-waiting-mode]").forEach((button) => button.addEventListener("click", () => {
     state.waitingMode = button.dataset.waitingMode;
     renderWaitingEvents(data, supplements);

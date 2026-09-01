@@ -606,6 +606,15 @@ describe("administration and ingestion", () => {
     let room = await request(app).get("/api/rooms/waiting-room").expect(200);
     assert.equal(room.body.sessions.length, 0, "候场事件不应提前创建直播场次");
     assert.equal(app.locals.database.counts().waiting_events, 3);
+    const pendingWaiting = await request(app).get("/api/rooms/waiting-room/waiting-events").expect(200);
+    assert.equal(pendingWaiting.body.pending, true);
+    assert.equal(pendingWaiting.body.session_id, null);
+    assert.equal(pendingWaiting.body.live_status, 0);
+    assert.equal(pendingWaiting.body.waiting_monitor_enabled, 1);
+    assert.deepEqual(pendingWaiting.body.counts, { gift_count: 1, danmaku_count: 1, entry_count: 1, user_count: 1 });
+    assert.equal(pendingWaiting.body.danmaku[0].content, "开播前先来打个招呼");
+    const pendingWaitingByInternalId = await request(app).get(`/api/rooms/${created.body.id}/waiting-events`).expect(200);
+    assert.deepEqual(pendingWaitingByInternalId.body.counts, pendingWaiting.body.counts, "兼容旧页面使用数据库内部 ID 请求候场数据");
 
     const liveAt = waitingAt + 5 * 60_000;
     connection.handler.onLiveStart({ id: "waiting-live", timestamp: liveAt, body: { room_id: 6677 } });
@@ -621,6 +630,10 @@ describe("administration and ingestion", () => {
     assert.equal(waiting.body.viewers[0].entry_count, 1);
     assert.equal(waiting.body.viewers[0].message_count, 1);
     assert.equal((await request(app).get(`/api/sessions/${session.id}/danmaku`).expect(200)).body.total, 0);
+    const clearedWaiting = await request(app).get("/api/rooms/waiting-room/waiting-events").expect(200);
+    assert.equal(clearedWaiting.body.live_status, 1);
+    assert.equal(clearedWaiting.body.active_session_id, session.id);
+    assert.deepEqual(clearedWaiting.body.counts, { gift_count: 0, danmaku_count: 0, entry_count: 0, user_count: 0 });
 
     connection.handler.onIncomeDanmu({ id: "live-danmaku", timestamp: liveAt + 1000, body: { timestamp: liveAt + 1000, user, content: "正式开播后的弹幕" } });
     const liveDanmaku = await request(app).get(`/api/sessions/${session.id}/danmaku`).expect(200);
@@ -635,6 +648,10 @@ describe("administration and ingestion", () => {
     });
     const firstWaiting = await request(app).get(`/api/sessions/${session.id}/waiting-events`).expect(200);
     assert.equal(firstWaiting.body.counts.danmaku_count, 1, "上一场结束后的消息不应归入上一场候场区");
+    const nextPendingWaiting = await request(app).get("/api/rooms/waiting-room/waiting-events").expect(200);
+    assert.equal(nextPendingWaiting.body.live_status, 0);
+    assert.equal(nextPendingWaiting.body.counts.danmaku_count, 1);
+    assert.equal(nextPendingWaiting.body.danmaku[0].content, "上一场结束后的候场弹幕");
 
     connection.handler.onLiveStart({ id: "next-live", timestamp: liveAt + 30_000, body: { room_id: 6677 } });
     room = await request(app).get("/api/rooms/waiting-room").expect(200);
@@ -643,6 +660,9 @@ describe("administration and ingestion", () => {
     const nextWaiting = await request(app).get(`/api/sessions/${nextSession.id}/waiting-events`).expect(200);
     assert.equal(nextWaiting.body.counts.danmaku_count, 1);
     assert.equal(nextWaiting.body.danmaku[0].content, "上一场结束后的候场弹幕");
+    const nextClearedWaiting = await request(app).get("/api/rooms/waiting-room/waiting-events").expect(200);
+    assert.equal(nextClearedWaiting.body.live_status, 1);
+    assert.equal(nextClearedWaiting.body.counts.danmaku_count, 0);
   });
 
   test("recognizes screenshots and imports ordered OCR supplements with optional XML timestamps", async () => {

@@ -358,6 +358,23 @@ export function createApp({
     return response.json({ ...room, sessions: database.listSessions(room.id) });
   });
 
+  app.get("/api/rooms/:identifier/waiting-events", (request, response, next) => {
+    const identifier = request.params.identifier;
+    const roomById = /^\d+$/.test(identifier) ? database.getRoomById(Number(identifier)) : null;
+    const room = database.getRoom(identifier) || (Number(roomById?.enabled) ? roomById : null);
+    if (!room) return next(httpError(404, "没有找到这个直播间"));
+    const activeSession = database.getActiveSessionForRoom(room.id);
+    response.set("Cache-Control", "no-store");
+    return response.json({
+      ...database.currentWaitingEventReport(room.id, {
+        includeNotes: canAccessRoomProtectedData(request, room.id),
+      }),
+      live_status: Number(Boolean(Number(room.live_status) || activeSession)),
+      waiting_monitor_enabled: Number(room.waiting_monitor_enabled || 0),
+      active_session_id: activeSession?.id || null,
+    });
+  });
+
   app.get("/api/rooms/:identifier/claim", (request, response, next) => {
     const room = database.getRoom(request.params.identifier);
     if (!room) return next(httpError(404, "没有找到这个直播间"));
