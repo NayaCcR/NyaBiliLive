@@ -153,7 +153,7 @@ function renderOverview() {
   const lastError = danmaku.rooms.find((room) => room.last_error)?.last_error || "暂无错误";
   const auth = danmaku.auth || { mode: "guest", uid: null };
   const authLabel = auth.mode === "authenticated" ? `已登录 · UID ${auth.uid}` : auth.mode === "cookie" ? "Cookie 不完整" : "访客模式";
-  const connectionRows = danmaku.rooms.map((room) => `<article class="danmaku-connection-row"><span><strong>房间 ${escapeHtml(room.room_number)}</strong><small>场次 #${count(room.session_id)}</small></span><span class="state-chip ${room.heartbeat_status === "healthy" ? "online" : ""}">${room.heartbeat_status === "healthy" ? "心跳正常" : room.heartbeat_status === "stale" ? "心跳超时" : escapeHtml(room.status)}</span><span><strong>${count(room.message_count)} 条</strong><small>${room.last_heartbeat_at ? `${dateTime(room.last_heartbeat_at)} 最近心跳` : "等待心跳"}</small><small>${room.last_event_at ? `${dateTime(room.last_event_at)} 最近事件` : "等待消息"} · ${count(room.heartbeat_restart_count)} 次自愈</small></span>${room.last_error ? `<small class="error-text">${escapeHtml(room.last_error)}${room.retry_at ? ` · ${dateTime(room.retry_at)} 重试` : ""}</small>` : room.last_recovery_reason ? `<small class="collector-recovery">${escapeHtml(room.last_recovery_reason)} · ${dateTime(room.last_recovery_at)}</small>` : ""}${room.reconnect_failure_streak ? `<small class="collector-backoff">连续失败 ${count(room.reconnect_failure_streak)} 次，正在保护性退避</small>` : ""}</article>`).join("") || '<div class="empty-inline">当前没有需要连接的直播中场次</div>';
+  const connectionRows = danmaku.rooms.map((room) => `<article class="danmaku-connection-row"><span><strong>房间 ${escapeHtml(room.room_number)}</strong><small>场次 #${count(room.session_id)}</small></span><span class="state-chip ${room.heartbeat_status === "healthy" ? "online" : ""}">${room.heartbeat_status === "healthy" ? "心跳正常" : room.heartbeat_status === "stale" ? "心跳超时" : escapeHtml(room.status)}</span><span><strong>${count(room.message_count)} 条</strong><small>${room.last_heartbeat_at ? `${dateTime(room.last_heartbeat_at)} 最近心跳` : "等待心跳"}</small><small>${room.last_event_at ? `${dateTime(room.last_event_at)} 最近事件` : "等待消息"} · ${count(room.heartbeat_restart_count)} 次自愈</small></span>${room.last_error ? `<small class="error-text">${escapeHtml(room.last_error)}${room.retry_at ? ` · ${dateTime(room.retry_at)} 重试` : ""}</small>` : room.last_recovery_reason ? `<small class="collector-recovery">${escapeHtml(room.last_recovery_reason)} · ${dateTime(room.last_recovery_at)}</small>` : ""}${room.reconnect_failure_streak ? `<small class="collector-backoff">连续失败 ${count(room.reconnect_failure_streak)} 次，正在保护性退避</small>` : ""}</article>`).join("") || '<div class="empty-inline">当前没有直播中或启用候场监控的房间</div>';
   document.querySelector("#admin-content").innerHTML = `<section class="metric-grid"><article><span>直播间</span><strong>${count(adminState.rooms.length)}</strong><small>${adminState.rooms.filter((room) => room.enabled).length} 个已启用</small></article><article><span>正在直播</span><strong>${count(liveRooms)}</strong><small>由公开房间接口检测</small></article><article><span>归档场次</span><strong>${count(totalSessions)}</strong><small>包含直播中场次</small></article><article><span>同步异常</span><strong>${count(failedRooms)}</strong><small>${failedRooms ? "请检查房间详情" : "所有房间正常"}</small></article></section><section class="surface monitor-surface"><header class="surface-heading"><div><p class="kicker">ROOM MONITOR</p><h2>自动同步</h2></div><span class="state-chip ${adminState.monitor.enabled ? "online" : ""}">${adminState.monitor.enabled ? "运行中" : "已关闭"}</span></header><div class="monitor-details"><span><small>检查间隔</small><strong>${adminState.monitor.interval_seconds} 秒</strong></span><span><small>上次运行</small><strong>${dateTime(adminState.monitor.last_run_at)}</strong></span><span><small>上次结果</small><strong>${adminState.monitor.last_result ? `${adminState.monitor.last_result.synced}/${adminState.monitor.last_result.checked} 成功` : "等待首次检查"}</strong></span></div></section><section class="surface monitor-surface"><header class="surface-heading"><div><p class="kicker">DANMAKU COLLECTOR</p><h2>内置弹幕采集</h2></div><div class="surface-actions"><button class="secondary-button small" id="restart-danmaku" type="button">↻ 重连弹幕</button><span class="state-chip ${danmaku.enabled ? "online" : ""}">${danmaku.enabled ? "已启用" : "已关闭"}</span></div></header><div class="monitor-details"><span><small>正在连接</small><strong>${connectedRooms}/${danmaku.rooms.length} 个房间</strong></span><span><small>本次连接已收消息</small><strong>${count(messageTotal)} 条</strong></span><span><small>Bilibili 身份</small><strong>${escapeHtml(authLabel)}</strong></span></div><div class="danmaku-connection-list">${connectionRows}</div>${lastError !== "暂无错误" ? `<p class="collector-error"><strong>最后错误</strong><span>${escapeHtml(lastError)}</span></p>` : ""}</section><section class="surface"><header class="surface-heading"><div><p class="kicker">RECENT ROOMS</p><h2>最近房间</h2></div><button class="secondary-button small" id="go-rooms">管理房间</button></header><div class="admin-room-list">${roomRows(adminState.rooms.slice(0, 5), false)}</div></section>`;
   document.querySelector("#go-rooms").addEventListener("click", () => changeView("rooms"));
   document.querySelector("#restart-danmaku").addEventListener("click", restartDanmaku);
@@ -168,7 +168,7 @@ async function restartDanmaku(event) {
 }
 
 function roomRows(rooms, actions = true) {
-  return rooms.map((room, index) => `<article class="admin-room-row" data-room-id="${room.id}"><span class="admin-avatar">${initials(room.streamer_name)}</span><span class="admin-room-copy"><strong>${escapeHtml(room.streamer_name)}</strong><small>/${escapeHtml(room.alias || room.room_number)} · ${count(room.session_count)} 场 · ${count(room.claim_manager_count)} 位管理者</small></span><span class="sync-cell"><span class="state-chip ${Number(room.live_status) === 1 ? "live" : ""}">${Number(room.live_status) === 1 ? "直播中" : "未开播"}</span><small class="${room.last_sync_error ? "error-text" : ""}">${room.last_sync_error ? escapeHtml(room.last_sync_error) : `${dateTime(room.last_sync_at)} 同步`}</small></span>${actions ? `<span class="row-actions"><button data-action="up" title="上移房间" ${index === 0 ? "disabled" : ""}>↑</button><button data-action="down" title="下移房间" ${index === rooms.length - 1 ? "disabled" : ""}>↓</button><button data-action="sync" title="立即同步">↻</button><button data-action="session" title="手动创建场次">＋</button><button data-action="edit" title="编辑房间">✎</button><button data-action="managers" title="认领管理者">👥</button><button data-action="delete" title="删除房间">×</button></span>` : `<a class="room-open-link" href="/${encodeURIComponent(room.alias || room.room_number)}">查看</a>`}</article>`).join("") || '<div class="empty-inline">还没有直播间</div>';
+  return rooms.map((room, index) => `<article class="admin-room-row" data-room-id="${room.id}"><span class="admin-avatar">${initials(room.streamer_name)}</span><span class="admin-room-copy"><strong>${escapeHtml(room.streamer_name)}</strong><small>/${escapeHtml(room.alias || room.room_number)} · ${count(room.session_count)} 场 · ${count(room.claim_manager_count)} 位管理者 · 候场${Number(room.waiting_monitor_enabled) === 1 ? "开" : "关"}</small></span><span class="sync-cell"><span class="state-chip ${Number(room.live_status) === 1 ? "live" : ""}">${Number(room.live_status) === 1 ? "直播中" : "未开播"}</span><small class="${room.last_sync_error ? "error-text" : ""}">${room.last_sync_error ? escapeHtml(room.last_sync_error) : `${dateTime(room.last_sync_at)} 同步`}</small></span>${actions ? `<span class="row-actions"><button data-action="up" title="上移房间" ${index === 0 ? "disabled" : ""}>↑</button><button data-action="down" title="下移房间" ${index === rooms.length - 1 ? "disabled" : ""}>↓</button><button data-action="sync" title="立即同步">↻</button><button data-action="session" title="手动创建场次">＋</button><button data-action="edit" title="编辑房间">✎</button><button data-action="delete" title="删除房间">×</button></span>` : `<a class="room-open-link" href="/${encodeURIComponent(room.alias || room.room_number)}">查看</a>`}</article>`).join("") || '<div class="empty-inline">还没有直播间</div>';
 }
 
 function renderRooms() {
@@ -184,7 +184,6 @@ function renderRooms() {
     if (button.dataset.action === "sync") button.addEventListener("click", () => syncRoom(room, button));
     if (button.dataset.action === "session") button.addEventListener("click", () => openSessionModal(room));
     if (button.dataset.action === "edit") { button.disabled = !adminState.managementEnabled; button.addEventListener("click", () => openRoomModal(room)); }
-    if (button.dataset.action === "managers") { button.disabled = !adminState.managementEnabled; button.addEventListener("click", () => openClaimManagersModal(room)); }
     if (button.dataset.action === "delete") { button.disabled = !adminState.managementEnabled; button.addEventListener("click", () => deleteRoom(room)); }
   });
 }
@@ -203,12 +202,30 @@ async function syncRoom(room, button) {
   catch (error) { toast(error.message, "error"); button.disabled = false; }
 }
 
-function openRoomModal(room = null) {
+async function openRoomModal(room = null) {
   document.body.append(document.querySelector("#room-modal-template").content.cloneNode(true));
   const modal = document.querySelector(".modal-backdrop:last-of-type"); const form = modal.querySelector("#room-form");
-  if (room) { modal.querySelector("#room-modal-title").textContent = "编辑直播间"; for (const key of ["room_number", "alias", "streamer_name", "avatar_url", "description"]) form.elements[key].value = room[key] || ""; form.elements.enabled.checked = Boolean(room.enabled); }
+  if (room) {
+    modal.querySelector("#room-modal-title").textContent = "编辑直播间";
+    for (const key of ["room_number", "alias", "streamer_name", "avatar_url", "description", "bark_device_token", "bark_server_url", "bark_title", "bark_body"]) form.elements[key].value = room[key] || (key === "bark_server_url" ? "https://api.day.app" : "");
+    form.elements.enabled.checked = Boolean(room.enabled);
+    form.elements.waiting_monitor_enabled.checked = Boolean(room.waiting_monitor_enabled);
+    try {
+      const details = await api(`/api/admin/rooms/${room.id}/claim-managers`);
+      form.elements.claim_manager_uids.value = details.items.map((item) => item.bili_uid).join("\n");
+    } catch (error) { toast(error.message, "error"); }
+  } else form.elements.bark_server_url.value = "https://api.day.app";
   bindModal(modal);
-  form.addEventListener("submit", async (event) => { event.preventDefault(); const button = form.querySelector("button[type=submit]"); button.disabled = true; const data = Object.fromEntries(new FormData(form)); data.enabled = form.elements.enabled.checked; try { await api(room ? `/api/admin/rooms/${room.id}` : "/api/admin/rooms", { method: room ? "PATCH" : "POST", body: JSON.stringify(data) }); modal.remove(); await Promise.all([loadRooms(), loadMonitor()]); renderRooms(); toast(room ? "房间信息已更新" : "房间已添加并完成首次同步"); } catch (error) { toast(error.message, "error"); button.disabled = false; } });
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault(); const button = form.querySelector("button[type=submit]"); button.disabled = true;
+    const data = Object.fromEntries(new FormData(form)); data.enabled = form.elements.enabled.checked; data.waiting_monitor_enabled = form.elements.waiting_monitor_enabled.checked;
+    const uids = normalizeUidList(data.claim_manager_uids); delete data.claim_manager_uids;
+    try {
+      const saved = await api(room ? `/api/admin/rooms/${room.id}` : "/api/admin/rooms", { method: room ? "PATCH" : "POST", body: JSON.stringify(data) });
+      await api(`/api/admin/rooms/${room?.id || saved.id}/claim-managers`, { method: "PUT", body: JSON.stringify({ uids }) });
+      modal.remove(); await Promise.all([loadRooms(), loadMonitor()]); renderRooms(); toast(room ? "房间信息已更新" : "房间已添加并完成首次同步");
+    } catch (error) { toast(error.message, "error"); button.disabled = false; }
+  });
 }
 
 function openSessionModal(room) {
@@ -216,52 +233,6 @@ function openSessionModal(room) {
   const modal = document.querySelector(".modal-backdrop:last-of-type"); const form = modal.querySelector("#session-form"); modal.querySelector("#session-modal-title").textContent = `为 ${room.streamer_name} 创建场次`;
   form.elements.started_at.value = new Date(Date.now() - new Date().getTimezoneOffset() * 60_000).toISOString().slice(0, 16); bindModal(modal);
   form.addEventListener("submit", async (event) => { event.preventDefault(); const data = Object.fromEntries(new FormData(form)); data.started_at = new Date(data.started_at).toISOString(); data.peak_popularity = Number(data.peak_popularity || 0); try { await api(`/api/admin/rooms/${room.id}/sessions`, { method: "POST", body: JSON.stringify(data) }); modal.remove(); await loadRooms(); renderRooms(); toast("场次已创建"); } catch (error) { toast(error.message, "error"); } });
-}
-
-async function openClaimManagersModal(room) {
-  try {
-    const managerApi = async (options = {}) => {
-      try {
-        return await api(`/api/admin/rooms/${room.id}/claim-managers`, options);
-      } catch (error) {
-        if (error.status === 404 && /API 路由不存在/.test(error.message)) {
-          return api(`/api/admin/rooms/${room.id}/managers`, options);
-        }
-        throw error;
-      }
-    };
-    const details = await managerApi();
-    document.body.append(document.querySelector("#claim-managers-modal-template").content.cloneNode(true));
-    const modal = document.querySelector(".modal-backdrop:last-of-type");
-    const form = modal.querySelector("#claim-managers-form");
-    modal.querySelector("#claim-managers-modal-title").textContent = `${details.streamer_name} · 认领管理者`;
-    form.elements.uids.value = details.items.map((item) => item.bili_uid).join("\n");
-    modal.querySelector("#claim-managers-note").textContent = details.bili_uid
-      ? `主播 UID ${details.bili_uid} 会自动保留在列表中。追加规则：只填数字 UID；可以一行一个，也可以写成 uid,uid,uid（逗号、中文逗号、空格都可以）。`
-      : "当前还没同步到主播 UID；你可以先手动填入允许认领的数字 UID，格式支持一行一个或 uid,uid,uid。";
-    bindModal(modal);
-    form.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      const button = form.querySelector("button[type=submit]");
-      button.disabled = true;
-      try {
-        const uids = normalizeUidList(form.elements.uids.value);
-        await managerApi({
-          method: "PUT",
-          body: JSON.stringify({ uids }),
-        });
-        modal.remove();
-        await loadRooms();
-        renderRooms();
-        toast("认领管理者已保存");
-      } catch (error) {
-        toast(error.message, "error");
-        button.disabled = false;
-      }
-    });
-  } catch (error) {
-    toast(/API 路由不存在/.test(error.message) ? "管理者接口暂不可用，请确认后端已更新并重启" : error.message, "error");
-  }
 }
 
 function bindModal(modal) { modal.querySelectorAll("[data-close]").forEach((button) => button.addEventListener("click", () => modal.remove())); modal.addEventListener("click", (event) => { if (event.target === modal) modal.remove(); }); }
@@ -289,7 +260,7 @@ function renderVisualConfig() {
       ${field("检查间隔（秒）", "monitoring.interval_seconds", c.monitoring.interval_seconds, "number")}
       ${field("请求超时（秒）", "monitoring.request_timeout_seconds", c.monitoring.request_timeout_seconds, "number")}
       ${field("弹幕协调间隔（秒）", "monitoring.danmaku_reconcile_seconds", c.monitoring.danmaku_reconcile_seconds, "number")}
-    </div>${toggleField("启用自动检查", "启动后立即同步，随后按间隔检查", "monitoring.enabled", c.monitoring.enabled)}${toggleField("自动更新主播资料", "使用 Bilibili 公开信息覆盖名称与头像", "monitoring.auto_update_room_profile", c.monitoring.auto_update_room_profile)}${toggleField("启用内置弹幕采集", "检测到直播场次后自动连接弹幕 WebSocket", "monitoring.danmaku_enabled", c.monitoring.danmaku_enabled)}</section>
+    </div>${toggleField("启用自动检查", "启动后立即同步，随后按间隔检查", "monitoring.enabled", c.monitoring.enabled)}${toggleField("自动更新主播资料", "使用 Bilibili 公开信息覆盖名称与头像", "monitoring.auto_update_room_profile", c.monitoring.auto_update_room_profile)}${toggleField("启用内置弹幕采集", "按直播状态和每个房间的候场开关管理弹幕长连接", "monitoring.danmaku_enabled", c.monitoring.danmaku_enabled)}</section>
     <section class="config-section"><h3>功能</h3>${toggleField("允许后台管理房间", "同时控制增删改 API", "features.admin_room_management", c.features.admin_room_management)}${toggleField("公开房间目录", "允许首页列出启用的房间", "features.public_room_directory", c.features.public_room_directory)}</section>
     <section class="config-section"><h3>显示</h3><div class="form-grid">${field("默认最少发言条数", "display.default_min_messages", c.display.default_min_messages, "number")}${field("弹幕每页数量", "display.danmaku_page_size", c.display.danmaku_page_size, "number")}${field("货币代码", "display.currency", c.display.currency)}</div></section>
     <section class="config-section"><h3>安全</h3><div class="form-grid">${field("管理员账号", "security.admin_username", c.security.admin_username, "text", true, "登录管理后台使用的账号。")}${field("管理员密码", "security.admin_password", c.security.admin_password, "password", true, "管理后台密码；修改后请妥善保存。")}${field("采集令牌", "security.ingest_token", c.security.ingest_token, "password", true, "外部采集程序写入 /api/ingest 时使用的 Bearer Token。")}${field("会话签名密钥", "security.session_secret", c.security.session_secret, "password", true, "用于签名后台登录 Cookie；更换后所有管理员会话失效。")}</div></section>

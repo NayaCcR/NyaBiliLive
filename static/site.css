@@ -207,6 +207,32 @@ a { color: inherit; }
 .gift-amount small { color: var(--muted-foreground); font-size: 8px; font-weight: 500; }
 .gift-amount em { color: var(--primary); font-size: 11px; font-style: normal; font-weight: 700; }
 .gift-view-toolbar { min-height: 46px; margin: -10px 0 24px; padding-bottom: 12px; display: flex; align-items: center; justify-content: space-between; gap: 14px; border-bottom: 1px solid var(--border); }
+.waiting-intro { min-height: 62px; margin: -4px 0 16px; display: flex; align-items: center; justify-content: space-between; gap: 18px; }
+.waiting-intro h3 { margin: 2px 0 0; font-size: 14px; }
+.waiting-intro small { display: block; margin-top: 6px; color: var(--muted-foreground); font-size: 10px; line-height: 1.55; }
+.waiting-intro > span { flex: 0 0 auto; padding: 5px 9px; border-radius: 999px; background: var(--primary-soft); color: var(--primary); font-size: 9px; font-weight: 700; }
+.waiting-event-tabs { width: fit-content; margin-bottom: 22px; }
+.waiting-event-view { min-height: 210px; }
+.supplement-importer { margin-bottom: 24px; padding: 18px; border: 1px solid rgba(235, 63, 152, .24); border-radius: var(--radius); background: linear-gradient(180deg, #fff9fc 0%, #fff 100%); }
+.supplement-importer > header, .supplement-importer > footer { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.supplement-importer h4 { margin: 2px 0 0; font-size: 14px; }
+.supplement-importer > header > span { padding: 4px 8px; border-radius: 999px; background: var(--primary-soft); color: var(--primary); font-size: 9px; font-weight: 700; }
+.supplement-input-grid { margin: 17px 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 13px; align-items: end; }
+.supplement-input-grid label { min-width: 0; display: grid; gap: 7px; color: var(--foreground); font-size: 10px; }
+.supplement-input-grid label.full { grid-column: 1 / -1; }
+.supplement-input-grid input, .supplement-input-grid textarea { width: 100%; min-height: 38px; padding: 9px 10px; border: 1px solid var(--border-strong); border-radius: 6px; background: white; color: var(--foreground); font: inherit; outline: none; }
+.supplement-input-grid textarea { min-height: 150px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; line-height: 1.65; }
+.supplement-input-grid input:focus, .supplement-input-grid textarea:focus { border-color: rgba(235, 63, 152, .6); box-shadow: 0 0 0 3px var(--primary-soft); }
+.supplement-input-grid small, #supplement-progress, .supplement-source { color: var(--muted-foreground); font-size: 9px; line-height: 1.5; }
+.supplement-records { min-width: 0; }
+.supplement-batches { margin: 0 0 10px; display: flex; flex-wrap: wrap; gap: 7px; }
+.supplement-batch { display: inline-flex; align-items: center; gap: 6px; padding: 5px 8px; border: 1px solid var(--border); border-radius: 6px; color: var(--muted-foreground); font-size: 9px; }
+.supplement-batch b { color: var(--foreground); }
+.supplement-batch button { padding: 0; border: 0; background: transparent; color: var(--red); font-size: 9px; }
+.supplement-row { position: relative; align-items: flex-start; }
+.supplement-sequence { flex: 0 0 48px; padding-top: 3px; color: var(--primary); font: 700 9px/1.3 ui-monospace, SFMono-Regular, Consolas, monospace; }
+.supplement-uid { padding: 2px 5px; border-radius: 4px; background: var(--muted); color: var(--muted-foreground); font-size: 8px; }
+.supplement-source { display: block; margin-top: 5px; }
 .segmented-control { display: flex; padding: 3px; border: 1px solid var(--border); border-radius: 6px; background: var(--muted); }
 .segmented-control button { min-height: 30px; padding: 0 12px; border: 0; border-radius: 4px; background: transparent; color: var(--muted-foreground); font-size: 10px; font-weight: 700; }
 .segmented-control button.active { background: white; color: var(--primary); box-shadow: 0 1px 4px rgba(20, 18, 23, .08); }
@@ -365,7 +391,6 @@ th:last-child, td:last-child { text-align: right; }
 .admin-room-copy small, .sync-cell small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted-foreground); font-size: 9px; }
 .row-actions { display: flex; gap: 5px; }
 .row-actions button { font-size: 13px; }
-.row-actions button[data-action="managers"] { font-size: 12px; }
 .room-open-link { color: var(--primary); font-size: 10px; }
 .warning-note { margin: 13px 17px; padding: 10px 12px; border: 1px solid #f0dfab; border-radius: 6px; background: var(--amber-soft); color: var(--amber); font-size: 10px; }
 .manager-note { margin: 0 18px; }
@@ -407,6 +432,10 @@ th:last-child, td:last-child { text-align: right; }
 .json-actions { padding: 13px 18px; }
 .modal-backdrop { position: fixed; inset: 0; z-index: 90; display: grid; place-items: center; padding: 18px; background: rgba(18, 16, 20, .46); backdrop-filter: blur(3px); }
 .modal { width: min(590px, 100%); max-height: calc(100vh - 36px); overflow-y: auto; border: 1px solid var(--border); border-radius: var(--radius); background: white; box-shadow: var(--shadow-lg); }
+.room-edit-modal { overscroll-behavior: contain; }
+.modal-section { padding-bottom: 18px; margin-bottom: 18px; border-bottom: 1px solid var(--border); }
+.modal-section:last-of-type { margin-bottom: 0; }
+.modal-section h3 { margin: 0 0 12px; font-size: 12px; }
 .modal-heading { min-height: 66px; padding: 14px 18px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); }
 .modal-heading h2 { margin: 0; font-size: 15px; }
 .modal-heading button { width: 32px; height: 32px; border: 0; border-radius: 6px; background: transparent; font-size: 20px; }
@@ -493,6 +522,11 @@ th:last-child, td:last-child { text-align: right; }
   .claim-code-actions, .claim-verify-actions { justify-content: stretch; }
   .claim-code-actions button, .claim-verify-actions button { width: 100%; }
   .danmaku-row time { width: 100%; margin: 0; }
+  .supplement-importer { padding: 14px; }
+  .supplement-input-grid { grid-template-columns: 1fr; }
+  .supplement-input-grid label.full { grid-column: auto; }
+  .supplement-importer > footer { align-items: stretch; flex-direction: column; }
+  .supplement-sequence { flex-basis: 40px; }
   .metric-grid { gap: 9px; }
   .metric-grid article { min-height: 96px; padding: 14px; }
   .metric-grid strong { font-size: 20px; }

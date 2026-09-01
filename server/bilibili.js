@@ -71,10 +71,11 @@ export class BilibiliApiClient {
 }
 
 export class BilibiliRoomMonitor {
-  constructor({ database, config, client = new BilibiliApiClient(), logger = console } = {}) {
+  constructor({ database, config, client = new BilibiliApiClient(), notifier = null, logger = console } = {}) {
     this.database = database;
     this.config = config;
     this.client = client;
+    this.notifier = notifier;
     this.logger = logger;
     this.timer = null;
     this.inFlight = false;
@@ -118,9 +119,14 @@ export class BilibiliRoomMonitor {
       const snapshot = await this.client.fetchRoomSnapshot(room.room_number, {
         timeoutSeconds: this.config.value.monitoring.request_timeout_seconds,
       });
-      return this.database.applyRoomSnapshot(room.id, snapshot, {
+      const result = this.database.applyRoomSnapshot(room.id, snapshot, {
         updateProfile: this.config.value.monitoring.auto_update_room_profile,
       });
+      if (result.wentLive && this.notifier) {
+        try { await this.notifier.notify(result.room, snapshot); }
+        catch (error) { this.logger.warn?.(`[bark] room ${room.room_number}: ${error.message}`); }
+      }
+      return result;
     } catch (error) {
       this.database.recordRoomSyncError(room.id, error.message);
       throw error;

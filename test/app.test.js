@@ -7,6 +7,7 @@ import request from "supertest";
 import { createApp } from "../server/index.js";
 import { ArchiveDatabase } from "../server/database.js";
 import { fetchBilibiliUserProfiles } from "../server/bilibili-profile.js";
+import { matchOcrWithXml, parseOcrSupplementText } from "../server/supplements.js";
 
 const projectConfig = path.resolve("config.example.json");
 let directory;
@@ -18,6 +19,9 @@ let profileRequests;
 let profileResponse;
 let mediaFetchCalls;
 let mediaFetchImpl;
+let barkFetchCalls;
+let ocrRequests;
+let ocrResponse;
 const defaultAdminPassword = "nya123nya321";
 const testAdminPassword = "test-admin-password-2026";
 
@@ -42,6 +46,9 @@ beforeEach(() => {
   profileRequests = [];
   profileResponse = [];
   mediaFetchCalls = 0;
+  barkFetchCalls = [];
+  ocrRequests = [];
+  ocrResponse = "";
   mediaFetchImpl = async () => new Response(Buffer.from([137, 80, 78, 71]), {
     headers: { "Content-Type": "image/png" },
   });
@@ -112,6 +119,17 @@ beforeEach(() => {
       mediaFetchCalls += 1;
       return mediaFetchImpl(...argumentsList);
     },
+    async barkFetch(url, options) {
+      barkFetchCalls.push({ url, options });
+      return new Response(JSON.stringify({ code: 200, message: "success" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    },
+    async ocrRecognizer(image, mimeType) {
+      ocrRequests.push({ image: Buffer.from(image), mimeType });
+      return ocrResponse;
+    },
   });
   agent = request.agent(app);
 });
@@ -120,6 +138,31 @@ afterEach(() => {
   app.locals.danmakuCollector.stop();
   app.locals.database.close();
   fs.rmSync(directory, { recursive: true, force: true });
+});
+
+test("parses OCR chat lines and only applies timestamps from matching XML events", () => {
+  const parsed = parseOcrSupplementText([
+    "榜1 柳雪杨Naya：来了！",
+    "系统提示：请遵守直播规范",
+    "不可闻的星笙：喵喵～",
+    "没有分隔符的说明文字",
+  ].join("\n"));
+  assert.deepEqual(parsed.items.map(({ username, content }) => ({ username, content })), [
+    { username: "柳雪杨Naya", content: "来了！" },
+    { username: "不可闻的星笙", content: "喵喵～" },
+  ]);
+  assert.equal(parsed.ignored_lines.length, 2);
+
+  const matched = matchOcrWithXml(parsed.items, [{
+    username: "柳***",
+    content: "来了!",
+    occurred_at: "2026-08-19T11:00:10.000Z",
+    offset_seconds: 1.5,
+  }]);
+  assert.equal(matched[0].source_kind, "ocr+xml");
+  assert.equal(matched[0].occurred_at, "2026-08-19T11:00:10.000Z");
+  assert.equal(matched[1].source_kind, "ocr");
+  assert.equal(matched[1].occurred_at, null);
 });
 
 describe("public archive", () => {
@@ -476,6 +519,350 @@ describe("administration and ingestion", () => {
     assert.equal(result.body.total, 1);
   });
 
+  test("controls offline danmaku preconnection with the per-room waiting monitor switch", async () => {
+    bilibiliSnapshot = {
+      bili_uid: "908070",
+      streamer_name: "候场开关测试主播",
+      avatar_url: "",
+      live_status: 0,
+      title: "尚未开播",
+      cover_url: "",
+      area: "聊天",
+      parent_area: "娱乐",
+      live_time: null,
+      attention: 0,
+      online: 0,
+    };
+    await loginAdmin();
+    const created = await agent.post("/api/admin/rooms").send({
+      room_number: "908070",
+      alias: "waiting-toggle",
+      streamer_name: "",
+      avatar_url: "",
+      description: "",
+      enabled: true,
+    }).expect(201);
+    assert.equal(created.body.waiting_monitor_enabled, 0);
+    assert.equal(app.locals.danmakuCollector.connections.has(created.body.id), false);
+    assert.equal(danmakuConnections.some((item) => String(item.roomNumber) === "908070"), false);
+
+    const enabled = await agent.patch(`/api/admin/rooms/${created.body.id}`)
+      .send({ waiting_monitor_enabled: true })
+      .expect(200);
+    assert.equal(enabled.body.waiting_monitor_enabled, 1);
+    const connection = danmakuConnections.find((item) => String(item.roomNumber) === "908070");
+    assert.ok(connection, "开启候场监控后应立即建立离线弹幕连接");
+    assert.equal(app.locals.danmakuCollector.connections.has(created.body.id), true);
+
+    const disabled = await agent.patch(`/api/admin/rooms/${created.body.id}`)
+      .send({ waiting_monitor_enabled: false })
+      .expect(200);
+    assert.equal(disabled.body.waiting_monitor_enabled, 0);
+    assert.equal(connection.closed, true, "关闭候场监控后应立即关闭离线连接");
+    assert.equal(app.locals.danmakuCollector.connections.has(created.body.id), false);
+  });
+
+  test("stores pre-live audience events in a waiting area and attaches them to the next session", async () => {
+    bilibiliSnapshot = {
+      bili_uid: "667700",
+      streamer_name: "候场测试主播",
+      avatar_url: "",
+      live_status: 0,
+      title: "等待开播",
+      cover_url: "",
+      area: "聊天",
+      parent_area: "娱乐",
+      live_time: null,
+      attention: 0,
+      online: 0,
+    };
+    await loginAdmin();
+    const created = await agent.post("/api/admin/rooms").send({
+      room_number: "6677",
+      alias: "waiting-room",
+      streamer_name: "",
+      avatar_url: "",
+      description: "",
+      enabled: true,
+      waiting_monitor_enabled: true,
+    }).expect(201);
+    app.locals.danmakuCollector.reconcile();
+    const connection = danmakuConnections.find((item) => String(item.roomNumber) === "6677");
+    assert.ok(connection);
+    connection.handler.onOpen();
+    connection.handler.onStartListen();
+
+    const waitingAt = Date.parse("2026-08-19T10:55:00.000Z");
+    const user = { uid: 778811, uname: "候场观众", face: "", identity: { guard_level: 0 } };
+    connection.handler.onUserAction({ id: "waiting-enter", timestamp: waitingAt, body: { action: "enter", timestamp: waitingAt, user } });
+    connection.handler.onIncomeDanmu({ id: "waiting-danmaku", timestamp: waitingAt + 1000, body: { timestamp: waitingAt + 1000, user, content: "开播前先来打个招呼" } });
+    connection.handler.onGift({
+      id: "waiting-gift",
+      timestamp: waitingAt + 2000,
+      raw: { tid: "waiting-gift-trade" },
+      body: { timestamp: waitingAt + 2000, user, gift_name: "小花花", coin_type: "gold", price: 1000, amount: 2 },
+    });
+
+    let room = await request(app).get("/api/rooms/waiting-room").expect(200);
+    assert.equal(room.body.sessions.length, 0, "候场事件不应提前创建直播场次");
+    assert.equal(app.locals.database.counts().waiting_events, 3);
+
+    const liveAt = waitingAt + 5 * 60_000;
+    connection.handler.onLiveStart({ id: "waiting-live", timestamp: liveAt, body: { room_id: 6677 } });
+    room = await request(app).get("/api/rooms/waiting-room").expect(200);
+    assert.equal(room.body.sessions.length, 1);
+    const session = room.body.sessions[0];
+    const waiting = await request(app).get(`/api/sessions/${session.id}/waiting-events`).expect(200);
+    assert.deepEqual(waiting.body.counts, { gift_count: 1, danmaku_count: 1, entry_count: 1, user_count: 1 });
+    assert.equal(waiting.body.gifts[0].gift_name, "小花花");
+    assert.equal(waiting.body.gifts[0].total_value, 2);
+    assert.equal(waiting.body.danmaku[0].content, "开播前先来打个招呼");
+    assert.equal(waiting.body.viewers[0].username, "候场观众");
+    assert.equal(waiting.body.viewers[0].entry_count, 1);
+    assert.equal(waiting.body.viewers[0].message_count, 1);
+    assert.equal((await request(app).get(`/api/sessions/${session.id}/danmaku`).expect(200)).body.total, 0);
+
+    connection.handler.onIncomeDanmu({ id: "live-danmaku", timestamp: liveAt + 1000, body: { timestamp: liveAt + 1000, user, content: "正式开播后的弹幕" } });
+    const liveDanmaku = await request(app).get(`/api/sessions/${session.id}/danmaku`).expect(200);
+    assert.equal(liveDanmaku.body.total, 1);
+    assert.equal(liveDanmaku.body.items[0].content, "正式开播后的弹幕");
+
+    connection.handler.onLiveEnd({ id: "waiting-live-end", timestamp: liveAt + 10_000, body: { room_id: 6677 } });
+    connection.handler.onIncomeDanmu({
+      id: "next-waiting-danmaku",
+      timestamp: liveAt + 20_000,
+      body: { timestamp: liveAt + 20_000, user, content: "上一场结束后的候场弹幕" },
+    });
+    const firstWaiting = await request(app).get(`/api/sessions/${session.id}/waiting-events`).expect(200);
+    assert.equal(firstWaiting.body.counts.danmaku_count, 1, "上一场结束后的消息不应归入上一场候场区");
+
+    connection.handler.onLiveStart({ id: "next-live", timestamp: liveAt + 30_000, body: { room_id: 6677 } });
+    room = await request(app).get("/api/rooms/waiting-room").expect(200);
+    assert.equal(room.body.sessions.length, 2);
+    const nextSession = room.body.sessions.find((item) => item.status === "live");
+    const nextWaiting = await request(app).get(`/api/sessions/${nextSession.id}/waiting-events`).expect(200);
+    assert.equal(nextWaiting.body.counts.danmaku_count, 1);
+    assert.equal(nextWaiting.body.danmaku[0].content, "上一场结束后的候场弹幕");
+  });
+
+  test("recognizes screenshots and imports ordered OCR supplements with optional XML timestamps", async () => {
+    bilibiliSnapshot = {
+      bili_uid: "135790",
+      streamer_name: "补录测试主播",
+      avatar_url: "",
+      live_status: 1,
+      title: "补录测试场次",
+      cover_url: "",
+      area: "聊天",
+      parent_area: "娱乐",
+      live_time: "2026-08-19T11:00:09.000Z",
+      attention: 0,
+      online: 10,
+    };
+    await loginAdmin();
+    const created = await agent.post("/api/admin/rooms").send({
+      room_number: "135790",
+      alias: "supplement-room",
+      streamer_name: "",
+      avatar_url: "",
+      description: "",
+      enabled: true,
+    }).expect(201);
+    const room = await request(app).get("/api/rooms/supplement-room").expect(200);
+    const session = room.body.sessions[0];
+    app.locals.database.ingest({
+      type: "danmaku",
+      session_id: session.id,
+      timestamp: "2026-08-19T11:01:00.000Z",
+      user: { uid: "24681357", username: "柳雪杨Naya", avatar_url: "", guard_level: 0 },
+      content: "建立昵称与 UID 的对应",
+      medal_name: "",
+      medal_level: 0,
+      is_superchat: false,
+      superchat_price: 0,
+    });
+
+    ocrResponse = "榜1 柳雪杨Naya：来了！\n不可闻的星笙：喵喵～";
+    await request(app).post(`/api/rooms/${created.body.id}/ocr`)
+      .set("Content-Type", "image/png")
+      .send(Buffer.from([137, 80, 78, 71]))
+      .expect(401);
+    const recognized = await agent.post(`/api/rooms/${created.body.id}/ocr`)
+      .set("Content-Type", "image/png")
+      .send(Buffer.from([137, 80, 78, 71]))
+      .expect(200);
+    assert.equal(recognized.body.text, ocrResponse);
+    assert.equal(ocrRequests.length, 1);
+    assert.equal(ocrRequests[0].mimeType, "image/png");
+
+    const ocrOnly = await agent.post(`/api/rooms/${created.body.id}/sessions/${session.id}/supplement-events`).send({
+      ocr_text: `${ocrResponse}\n系统提示：忽略这一行`,
+    }).expect(201);
+    assert.equal(ocrOnly.body.imported_count, 2);
+    assert.equal(ocrOnly.body.matched_time_count, 0);
+    assert.equal(ocrOnly.body.matched_uid_count, 1);
+    assert.equal(ocrOnly.body.ignored_line_count, 1);
+    assert.deepEqual(ocrOnly.body.items.map((item) => item.sequence_no), [1, 2]);
+    assert.ok(ocrOnly.body.items.every((item) => item.occurred_at === null));
+
+    const withXml = await agent.post(`/api/rooms/${created.body.id}/sessions/${session.id}/supplement-events`).send({
+      ocr_text: "柳雪杨Naya：XML 配对成功",
+      xml_events: [{
+        username: "柳***",
+        content: "XML 配对成功",
+        occurred_at: "2026-08-19T11:00:12.345Z",
+        offset_seconds: 3.345,
+      }],
+    }).expect(201);
+    assert.equal(withXml.body.first_sequence_no, 3);
+    assert.equal(withXml.body.matched_time_count, 1);
+    assert.equal(withXml.body.items[0].source_kind, "ocr+xml");
+    assert.equal(withXml.body.items[0].occurred_at, "2026-08-19T11:00:12.345Z");
+
+    await agent.delete(`/api/rooms/${created.body.id}/sessions/${session.id}/supplement-events/${withXml.body.batch_id}`).expect(200);
+    const afterDelete = await agent.post(`/api/rooms/${created.body.id}/sessions/${session.id}/supplement-events`).send({
+      ocr_text: "不可闻的星笙：删除批次后继续补录",
+    }).expect(201);
+    assert.equal(afterDelete.body.first_sequence_no, 4, "删除批次后内部序号不应复用");
+
+    const report = await request(app).get(`/api/sessions/${session.id}/supplement-events`).expect(200);
+    assert.deepEqual(report.body.items.map((item) => item.sequence_no), [1, 2, 4]);
+    assert.equal(report.body.items[0].bili_uid, "24681357");
+    assert.equal(report.body.total, 3);
+  });
+
+  test("preconnects offline rooms and keeps opening danmaku before HTTP detects the live session", async () => {
+    bilibiliSnapshot = {
+      bili_uid: "112233",
+      streamer_name: "开场捕获测试主播",
+      avatar_url: "",
+      live_status: 0,
+      title: "等待开播",
+      cover_url: "",
+      area: "聊天",
+      parent_area: "娱乐",
+      live_time: null,
+      attention: 0,
+      online: 0,
+    };
+    await loginAdmin();
+    const created = await agent.post("/api/admin/rooms").send({
+      room_number: "1122",
+      alias: "opening-capture",
+      streamer_name: "",
+      avatar_url: "",
+      description: "",
+      enabled: true,
+      waiting_monitor_enabled: true,
+    }).expect(201);
+    assert.equal(created.body.live_status, 0);
+
+    app.locals.danmakuCollector.reconcile();
+    const connection = danmakuConnections.find((item) => String(item.roomNumber) === "1122");
+    assert.ok(connection, "启用候场监控的离线房间应当预先连接弹幕服务器");
+    assert.equal(connection.options.ws.keepalive, true);
+    connection.handler.onOpen();
+    connection.handler.onStartListen();
+
+    const officialStart = "2026-08-19T11:00:09.000Z";
+    const liveEventAt = Date.parse("2026-08-19T11:00:10.000Z");
+    connection.handler.onLiveStart({ id: "live-start-1", timestamp: liveEventAt, body: { room_id: 1122 } });
+    const user = { uid: 223344, uname: "开场观众", face: "", identity: { guard_level: 0 } };
+    connection.handler.onIncomeDanmu({
+      id: "opening-danmaku-1",
+      timestamp: liveEventAt + 1000,
+      body: { timestamp: liveEventAt + 1000, user, content: "开播第一时间的弹幕" },
+    });
+
+    let room = await request(app).get("/api/rooms/opening-capture").expect(200);
+    assert.equal(room.body.sessions.length, 1);
+    assert.equal(room.body.sessions[0].status, "live");
+    assert.equal(room.body.sessions[0].started_at, new Date(liveEventAt).toISOString());
+    let danmaku = await request(app).get(`/api/sessions/${room.body.sessions[0].id}/danmaku`).expect(200);
+    assert.equal(danmaku.body.total, 1);
+    assert.equal(danmaku.body.items[0].content, "开播第一时间的弹幕");
+    const viewers = await request(app).get(`/api/sessions/${room.body.sessions[0].id}/viewers?min_messages=0`).expect(200);
+    assert.equal(viewers.body.items[0].username, "开场观众");
+
+    connection.handler.onIncomeDanmu({
+      id: "opening-danmaku-name-match",
+      timestamp: liveEventAt + 1500,
+      body: {
+        timestamp: liveEventAt + 1500,
+        user: { uid: 0, uname: "开场观众", face: "", identity: { guard_level: 0 } },
+        content: "通过唯一昵称恢复 UID",
+      },
+    });
+    const nameMatched = await request(app)
+      .get(`/api/sessions/${room.body.sessions[0].id}/danmaku?q=${encodeURIComponent("通过唯一昵称恢复 UID")}`)
+      .expect(200);
+    assert.equal(nameMatched.body.items[0].bili_uid, "223344");
+
+    connection.handler.onIncomeDanmu({
+      id: "opening-danmaku-duplicate-name",
+      timestamp: liveEventAt + 1600,
+      body: {
+        timestamp: liveEventAt + 1600,
+        user: { uid: 556677, uname: "开场观众", face: "", identity: { guard_level: 0 } },
+        content: "建立重名用户",
+      },
+    });
+    connection.handler.onIncomeDanmu({
+      id: "opening-danmaku-ambiguous-name",
+      timestamp: liveEventAt + 1700,
+      body: {
+        timestamp: liveEventAt + 1700,
+        user: { uid: 0, uname: "开场观众", face: "", identity: { guard_level: 0 } },
+        content: "重名时保持游客身份",
+      },
+    });
+    const ambiguousName = await request(app)
+      .get(`/api/sessions/${room.body.sessions[0].id}/danmaku?q=${encodeURIComponent("重名时保持游客身份")}`)
+      .expect(200);
+    assert.equal(ambiguousName.body.items[0].bili_uid, "guest:开场观众");
+
+    const rawOnlyInfo = [];
+    rawOnlyInfo[0] = [];
+    rawOnlyInfo[0][15] = { user: { base: { face: "https://i0.hdslb.com/bfs/face/raw-fallback.jpg" } } };
+    rawOnlyInfo[2] = [334455, "原始字段观众"];
+    connection.handler.onIncomeDanmu({
+      id: "opening-danmaku-raw-user",
+      timestamp: liveEventAt + 2000,
+      raw: { info: rawOnlyInfo },
+      body: {
+        timestamp: liveEventAt + 2000,
+        user: { uid: 0, uname: "", face: "", identity: { guard_level: 0 } },
+        content: "从原始包恢复用户",
+      },
+    });
+    const recovered = await request(app)
+      .get(`/api/sessions/${room.body.sessions[0].id}/danmaku?q=${encodeURIComponent("从原始包恢复用户")}`)
+      .expect(200);
+    assert.equal(recovered.body.items[0].bili_uid, "334455");
+    assert.equal(recovered.body.items[0].username, "原始字段观众");
+    assert.equal(recovered.body.items[0].avatar_url, "https://i0.hdslb.com/bfs/face/raw-fallback.jpg");
+
+    await agent.post(`/api/admin/rooms/${created.body.id}/sync`).send({}).expect(200);
+    room = await request(app).get("/api/rooms/opening-capture").expect(200);
+    assert.equal(room.body.sessions.length, 1);
+    assert.equal(room.body.sessions[0].status, "live", "刚收到 LIVE 时应忽略尚未传播的离线 HTTP 快照");
+
+    bilibiliSnapshot = {
+      ...bilibiliSnapshot,
+      live_status: 1,
+      title: "正式开播标题",
+      live_time: officialStart,
+      attention: 100,
+      online: 20,
+    };
+    await agent.post(`/api/admin/rooms/${created.body.id}/sync`).send({}).expect(200);
+    room = await request(app).get("/api/rooms/opening-capture").expect(200);
+    assert.equal(room.body.sessions.length, 1, "HTTP 同步不应重复创建场次");
+    assert.equal(room.body.sessions[0].started_at, officialStart);
+    danmaku = await request(app).get(`/api/sessions/${room.body.sessions[0].id}/danmaku`).expect(200);
+    assert.equal(danmaku.body.total, 5, "校准官方开播时间后，早期弹幕应当保留");
+  });
+
   test("collects WebSocket danmaku, entries and gifts into the active session", async () => {
     bilibiliSnapshot = {
       bili_uid: "778899",
@@ -506,7 +893,7 @@ describe("administration and ingestion", () => {
     const connection = danmakuConnections.find((item) => String(item.roomNumber) === "7788");
     assert.ok(connection);
     assert.equal(connection.options.ws.uid, 0);
-    assert.equal(connection.options.ws.keepalive, false);
+    assert.equal(connection.options.ws.keepalive, true);
     connection.handler.onOpen();
     connection.handler.onStartListen();
     connection.handler.onAttentionChange({ body: { attention: 2048 } });
@@ -771,5 +1158,55 @@ describe("administration and ingestion", () => {
     const ended = await request(app).get("/api/rooms/auto-room").expect(200);
     assert.equal(ended.body.sessions[0].status, "ended");
     assert.ok(ended.body.sessions[0].ended_at);
+  });
+
+  test("stores Bark settings and notifies every device once when a room goes live", async () => {
+    bilibiliSnapshot = {
+      bili_uid: "445566",
+      streamer_name: "提醒测试主播",
+      avatar_url: "",
+      live_status: 0,
+      title: "开播前",
+      cover_url: "",
+      area: "聊天",
+      parent_area: "娱乐",
+      live_time: null,
+      online: 0,
+    };
+    await loginAdmin();
+    const created = await agent.post("/api/admin/rooms").send({
+      room_number: "4455",
+      alias: "bark-room",
+      streamer_name: "",
+      avatar_url: "",
+      description: "",
+      enabled: true,
+      bark_device_token: "device-a\ndevice-b,device-a",
+      bark_server_url: "https://bark.example.test/custom",
+      bark_title: "{streamer_name} 开播",
+      bark_body: "{title}\n{live_url}",
+    }).expect(201);
+    assert.equal(created.body.bark_device_token, "device-a\ndevice-b,device-a");
+    assert.equal(created.body.bark_server_url, "https://bark.example.test/custom");
+    assert.equal(barkFetchCalls.length, 0);
+
+    bilibiliSnapshot = {
+      ...bilibiliSnapshot,
+      live_status: 1,
+      title: "多设备提醒场次",
+      live_time: "2026-08-08T10:00:00.000Z",
+      online: 100,
+    };
+    await agent.post(`/api/admin/rooms/${created.body.id}/sync`).send({}).expect(200);
+    assert.deepEqual(barkFetchCalls.map((call) => call.url).sort(), [
+      "https://bark.example.test/custom/device-a",
+      "https://bark.example.test/custom/device-b",
+    ]);
+    const payload = JSON.parse(barkFetchCalls[0].options.body);
+    assert.equal(payload.title, "提醒测试主播 开播");
+    assert.equal(payload.body, "多设备提醒场次\nhttps://live.bilibili.com/4455");
+
+    await agent.post(`/api/admin/rooms/${created.body.id}/sync`).send({}).expect(200);
+    assert.equal(barkFetchCalls.length, 2);
   });
 });

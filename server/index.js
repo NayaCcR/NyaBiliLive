@@ -8,10 +8,12 @@ import morgan from "morgan";
 import { ZodError } from "zod";
 import { ArchiveDatabase } from "./database.js";
 import { BilibiliRoomMonitor } from "./bilibili.js";
+import { BarkNotifier } from "./bark.js";
 import { BilibiliAuthClient } from "./bilibili-auth.js";
 import { DanmakuCollector } from "./danmaku.js";
 import { BilibiliMediaProxy } from "./media.js";
 import { ConfigStore } from "./config.js";
+import { matchOcrWithXml, OcrService, parseOcrSupplementText } from "./supplements.js";
 import {
   changePasswordSchema,
   ingestEventSchema,
@@ -20,6 +22,7 @@ import {
   roomClaimManagersUpdateSchema,
   roomUpdateSchema,
   sessionCreateSchema,
+  supplementImportSchema,
   sessionUpdateSchema,
   viewerNoteUpdateSchema,
 } from "./schemas.js";
@@ -115,16 +118,20 @@ export function createApp({
   danmakuListenerFactory,
   bilibiliUserProfileFetcher,
   mediaFetch = fetch,
+  barkFetch = fetch,
+  ocrRecognizer,
 } = {}) {
   if (isInsideDirectory(staticDirectory, path.resolve(configPath))) {
     throw new Error("NYABILILIVE_CONFIG 不能位于 static 公开目录内");
   }
   const config = new ConfigStore(configPath);
   const database = new ArchiveDatabase(databasePath, { seed });
+  const barkNotifier = new BarkNotifier({ fetchImpl: barkFetch, logger: logger ? console : { warn() {} } });
   const monitor = new BilibiliRoomMonitor({
     database,
     config,
     client: bilibiliClient,
+    notifier: barkNotifier,
     logger: logger ? console : { warn() {} },
   });
   const danmakuCollector = new DanmakuCollector({
@@ -135,6 +142,11 @@ export function createApp({
     logger: logger ? console : { info() {}, warn() {} },
   });
   const mediaProxy = new BilibiliMediaProxy({ fetchImpl: mediaFetch });
+  const ocrService = new OcrService({
+    recognizer: ocrRecognizer,
+    cachePath: path.join(path.dirname(path.resolve(databasePath)), "ocr-cache"),
+    logger: logger ? console : { info() {}, warn() {} },
+  });
   let authMaintenanceInFlight = false;
   let lastAuthMaintenance = null;
   const maintainBilibiliAuth = async () => {
@@ -174,6 +186,8 @@ export function createApp({
   app.locals.danmakuCollector = danmakuCollector;
   app.locals.mediaProxy = mediaProxy;
   app.locals.bilibiliAuthClient = bilibiliAuthClient;
+  app.locals.barkNotifier = barkNotifier;
+  app.locals.ocrService = ocrService;
   app.locals.maintainBilibiliAuth = maintainBilibiliAuth;
   app.disable("x-powered-by");
   app.use(helmet({
@@ -191,7 +205,13 @@ export function createApp({
     },
   }));
   if (logger) app.use(morgan("dev"));
-  app.use(express.json({ limit: "2mb" }));
+  const jsonParser = express.json({ limit: "2mb" });
+  const supplementJsonParser = express.json({ limit: "10mb" });
+  app.use((request, response, next) => {
+    const isSupplementImport = request.method === "POST"
+      && /^\/api\/rooms\/\d+\/sessions\/\d+\/supplement-events$/.test(request.path);
+    return (isSupplementImport ? supplementJsonParser : jsonParser)(request, response, next);
+  });
   app.use((request, _response, next) => {
     if (!SAFE_HTTP_METHODS.has(request.method) && !requestMatchesOrigin(request)) {
       return next(httpError(403, "已拒绝来自其他站点的写入请求"));
@@ -260,6 +280,12 @@ export function createApp({
     const roomId = Number(request.params.id);
     if (!roomId || !isRoomClaimed(request, roomId)) return next(httpError(401, "请先登录管理后台或认领这个直播间"));
     return next();
+  };
+  const requireRoomSessionClaimOrAdmin = (request, response, next) => {
+    const session = database.getSession(Number(request.params.sessionId));
+    if (!session || Number(session.room_id) !== Number(request.params.id)) return next(httpError(404, "场次不存在"));
+    request.managedSession = session;
+    return requireRoomClaimOrAdmin(request, response, next);
   };
 
   const requireAdmin = (request, _response, next) => {
@@ -467,6 +493,59 @@ export function createApp({
     }));
   });
 
+  app.get("/api/sessions/:id/waiting-events", (request, response, next) => {
+    const session = database.getSession(Number(request.params.id));
+    if (!session) return next(httpError(404, "场次不存在"));
+    return response.json(database.waitingEventReport(session.id, {
+      includeNotes: canAccessRoomProtectedData(request, session.room_id),
+    }));
+  });
+
+  app.get("/api/sessions/:id/supplement-events", (request, response, next) => {
+    const session = database.getSession(Number(request.params.id));
+    if (!session) return next(httpError(404, "场次不存在"));
+    return response.json(database.supplementEventReport(session.id, {
+      includeNotes: canAccessRoomProtectedData(request, session.room_id),
+    }));
+  });
+
+  app.post(
+    "/api/rooms/:id/ocr",
+    requireRoomClaimOrAdmin,
+    express.raw({ type: ["image/png", "image/jpeg", "image/webp", "image/bmp"], limit: "15mb" }),
+    async (request, response, next) => {
+      if (!Buffer.isBuffer(request.body) || !request.body.length) return next(httpError(400, "请选择 PNG、JPEG、WebP 或 BMP 截图"));
+      const mimeType = String(request.get("Content-Type") || "").split(";", 1)[0].toLowerCase();
+      if (!new Set(["image/png", "image/jpeg", "image/webp", "image/bmp"]).has(mimeType)) {
+        return next(httpError(415, "不支持这种图片格式"));
+      }
+      const text = await ocrService.recognize(request.body, mimeType);
+      if (!text) return next(httpError(422, "图片中没有识别出文字"));
+      return response.json({ text });
+    },
+  );
+
+  app.post("/api/rooms/:id/sessions/:sessionId/supplement-events", requireRoomSessionClaimOrAdmin, (request, response, next) => {
+    const input = supplementImportSchema.parse(request.body);
+    const parsed = parseOcrSupplementText(input.ocr_text);
+    if (!parsed.items.length) return next(httpError(400, "没有识别出“昵称：内容”格式的记录，请先修正 OCR 文本"));
+    const matched = matchOcrWithXml(parsed.items, input.xml_events);
+    const imported = database.importSupplementEvents(request.managedSession.id, matched);
+    return response.status(201).json({
+      ...imported,
+      ignored_line_count: parsed.ignored_lines.length,
+      items: database.supplementEventReport(request.managedSession.id, {
+        includeNotes: true,
+      }).items.filter((item) => item.batch_id === imported.batch_id),
+    });
+  });
+
+  app.delete("/api/rooms/:id/sessions/:sessionId/supplement-events/:batchId", requireRoomSessionClaimOrAdmin, (request, response, next) => {
+    const changes = database.deleteSupplementBatch(request.managedSession.id, request.params.batchId);
+    if (!changes) return next(httpError(404, "补录批次不存在"));
+    return response.json({ ok: true, deleted_count: changes });
+  });
+
   app.post("/api/auth/login", (request, response, next) => {
     const credentials = loginSchema.parse(request.body);
     const security = config.value.security;
@@ -636,12 +715,14 @@ export function createApp({
     } catch {
       room = database.getRoomById(room.id);
     }
+    danmakuCollector.reconcile();
     response.status(201).json(room);
   });
 
   app.patch("/api/admin/rooms/:id", requireRoomManagement, (request, response, next) => {
     const result = database.updateRoom(Number(request.params.id), roomUpdateSchema.parse(request.body));
     if (!result) return next(httpError(404, "房间不存在"));
+    danmakuCollector.reconcile();
     return response.json(result);
   });
 
@@ -755,6 +836,7 @@ export function startServer(options = {}) {
   server.on("close", () => {
     app.locals.monitor.stop();
     app.locals.danmakuCollector.stop();
+    void app.locals.ocrService.close();
     clearInterval(authMaintenanceTimer);
   });
   return { app, server };

@@ -65,6 +65,7 @@
             <label class="field"><span>头像地址</span><input name="avatar_url" type="url" placeholder="https://"></label>
             <label class="field full"><span>房间说明</span><textarea name="description" maxlength="500"></textarea></label>
             <div class="field full"><label class="toggle-field"><div><strong>在前台启用</strong><span>关闭后房间号和别名都不可公开访问</span></div><span class="toggle"><input name="enabled" type="checkbox" checked><i></i></span></label></div>
+            <div class="field full"><label class="toggle-field"><div><strong>候场监控</strong><span>未开播时保持弹幕长连接；直播状态轮询不受影响</span></div><span class="toggle"><input name="waiting_monitor_enabled" type="checkbox"><i></i></span></label></div>
           </div>
           <div class="modal-actions"><button class="button secondary" type="button" data-close>取消</button><button class="button" type="submit">保存房间</button></div>
         </form>

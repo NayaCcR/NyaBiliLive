@@ -2,6 +2,8 @@ import { z } from "zod";
 
 const requiredText = z.string().trim().min(1);
 const optionalUrl = z.union([z.url(), z.literal("")]).default("");
+const barkServerUrl = z.string().trim().url().default("https://api.day.app");
+const barkText = (max, fallback = "") => z.string().trim().max(max).default(fallback);
 
 export const configSchema = z.object({
   app: z.object({
@@ -55,6 +57,11 @@ export const roomCreateSchema = z.object({
   avatar_url: optionalUrl,
   description: z.string().trim().max(500).default(""),
   enabled: z.boolean().default(true),
+  waiting_monitor_enabled: z.boolean().default(false),
+  bark_device_token: barkText(4000),
+  bark_server_url: barkServerUrl,
+  bark_title: barkText(200),
+  bark_body: barkText(2000),
 });
 
 export const roomUpdateSchema = roomCreateSchema.partial();
@@ -130,4 +137,16 @@ const managerUidSchema = z.union([z.string(), z.number()])
 
 export const roomClaimManagersUpdateSchema = z.object({
   uids: z.array(managerUidSchema).max(200).default([]),
+});
+
+const supplementXmlEventSchema = z.object({
+  username: z.string().trim().max(100).default(""),
+  content: z.string().trim().min(1).max(1000),
+  occurred_at: z.iso.datetime(),
+  offset_seconds: z.coerce.number().min(0).max(60 * 60 * 48).nullable().optional(),
+});
+
+export const supplementImportSchema = z.object({
+  ocr_text: z.string().max(200_000).refine((value) => value.trim().length > 0, "OCR 文本不能为空"),
+  xml_events: z.array(supplementXmlEventSchema).max(20_000).default([]),
 });

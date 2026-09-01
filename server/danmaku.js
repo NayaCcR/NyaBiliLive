@@ -30,11 +30,47 @@ function messageAvatar(message, user = {}) {
   return String(candidates.find((value) => typeof value === "string" && value.trim()) || "");
 }
 
-function normalizeUser(user = {}, fallback = "anonymous", avatarUrl = "") {
-  const uid = Number(user.uid || 0);
-  const username = String(user.uname || user.username || "匿名观众");
+function firstPresent(values) {
+  return values.find((value) => value !== undefined && value !== null && String(value).trim() !== "");
+}
+
+function firstUid(values) {
+  return values.map((value) => String(value ?? "").trim()).find((value) => /^[1-9]\d*$/.test(value));
+}
+
+function messageUser(message, user = {}) {
+  const raw = message.raw || {};
+  const rawInfoUser = raw.info?.[2] || [];
+  const extraBase = raw.info?.[0]?.[15]?.user?.base || {};
+  const originBase = extraBase.origin_info || {};
   return {
-    uid: uid > 0 ? String(uid) : `guest:${username || fallback}`,
+    ...user,
+    uid: firstUid([
+      user.uid, user.mid, rawInfoUser[0], raw.user_info?.uid, raw.user_info?.mid,
+      raw.uid, raw.mid, extraBase.uid, extraBase.mid, originBase.uid, originBase.mid,
+    ]),
+    uname: firstPresent([
+      user.uname, user.username, rawInfoUser[1], raw.user_info?.uname, raw.user_info?.name,
+      raw.uname, raw.username, raw.name, extraBase.name, extraBase.uname, originBase.name, originBase.uname,
+    ]),
+    face: messageAvatar(message, user),
+    identity: {
+      ...(user.identity || {}),
+      guard_level: firstPresent([
+        user.identity?.guard_level, user.guard_level, raw.user_info?.guard_level,
+        raw.guard_level, raw.medal_info?.guard_level,
+      ]) || 0,
+    },
+  };
+}
+
+function normalizeUser(user = {}, fallback = "anonymous", avatarUrl = "") {
+  const rawUid = String(user.uid ?? user.mid ?? "").trim();
+  const uid = /^[1-9]\d*$/.test(rawUid) ? rawUid : "";
+  const suppliedUsername = String(user.uname || user.username || "").trim();
+  const username = suppliedUsername || "匿名观众";
+  return {
+    uid: uid || `guest:${suppliedUsername || fallback}`,
     username,
     avatar_url: String(avatarUrl || user.face || ""),
     guard_level: Number(user.identity?.guard_level || 0),
@@ -42,7 +78,8 @@ function normalizeUser(user = {}, fallback = "anonymous", avatarUrl = "") {
 }
 
 function normalizeMessageUser(message, user = message.body?.user, fallback = message.id) {
-  return normalizeUser(user, fallback, messageAvatar(message, user));
+  const resolved = messageUser(message, user || {});
+  return normalizeUser(resolved, fallback, resolved.face);
 }
 
 function giftName(body = {}, raw = {}) {
@@ -115,7 +152,7 @@ function giftTimestamp(message, body = message.body || {}, raw = message.raw || 
 
 function normalizeGiftUser(message, body = message.body || {}, raw = message.raw || {}, fallback = message.id) {
   if (body.user) return normalizeMessageUser(message, body.user, fallback);
-  return normalizeUser({
+  return normalizeMessageUser(message, {
     uid: raw.uid,
     uname: raw.uname || raw.username,
     face: raw.face,
@@ -365,12 +402,15 @@ export class DanmakuCollector {
     if (this.reconciling || !this.config.value.monitoring.danmaku_enabled) return;
     this.reconciling = true;
     try {
-      const desired = new Map(this.database.listLiveRoomsWithSessions().map((room) => [room.id, room]));
+      // Live rooms always connect. Offline rooms only stay connected when their
+      // per-room waiting monitor is enabled, limiting long-lived idle connections.
+      const desired = new Map(this.database.listDanmakuMonitorRooms().map((room) => [room.id, room]));
       for (const roomId of this.connections.keys()) {
         if (!desired.has(roomId)) this.stopRoom(roomId);
       }
       for (const room of desired.values()) {
         const current = this.connections.get(room.id);
+        if (current) current.sessionId = this.database.getActiveSessionForRoom(room.id)?.id || null;
         const heartbeatExpired = current && this.heartbeatStatus(current) === "stale";
         if (heartbeatExpired && !current.recoveryScheduled) {
           const elapsed = Math.floor((Date.now() - Math.max(
@@ -386,7 +426,7 @@ export class DanmakuCollector {
         const needsRestart = current && (
           (["closed", "error"].includes(current.status) && retryReady)
         );
-        if (!current || current.sessionId !== room.session_id || needsRestart) {
+        if (!current || needsRestart) {
           if (needsRestart) {
             const recovery = this.heartbeatRecovery.get(room.id);
             if (recovery) this.heartbeatRecovery.set(room.id, {
@@ -411,7 +451,7 @@ export class DanmakuCollector {
     const connection = {
       roomId: room.id,
       roomNumber: String(room.room_number),
-      sessionId: room.session_id,
+      sessionId: this.database.getActiveSessionForRoom(room.id)?.id || null,
       instance: null,
       status: "connecting",
       connectedAt: null,
@@ -431,7 +471,7 @@ export class DanmakuCollector {
     };
     this.connections.set(room.id, connection);
     const isCurrent = () => !connection.stopped && this.connections.get(room.id) === connection;
-    const recordEvent = () => {
+    const recordActivity = (countMessage = false) => {
       if (!isCurrent()) return;
       clearHandshakeTimer();
       connection.status = "listening";
@@ -439,8 +479,9 @@ export class DanmakuCollector {
       connection.lastError = "";
       this.cancelPendingRecovery(connection);
       connection.lastEventAt = new Date().toISOString();
-      connection.messageCount += 1;
+      if (countMessage) connection.messageCount += 1;
     };
+    const recordEvent = () => recordActivity(true);
     const recordHeartbeat = () => {
       if (!isCurrent()) return;
       clearHandshakeTimer();
@@ -471,14 +512,24 @@ export class DanmakuCollector {
       const message = error instanceof Error ? error.message : String(error);
       this.scheduleRecovery(connection, message);
     };
+    const ensureSession = (startedAt = new Date().toISOString()) => {
+      const session = this.database.getActiveSessionForRoom(room.id)
+        || this.database.ensureLiveSessionFromEvent(room.id, startedAt);
+      if (session) connection.sessionId = session.id;
+      return session;
+    };
     const ingest = (event) => {
       if (!isCurrent()) return;
       try {
         const session = this.database.getActiveSessionForRoom(room.id);
-        if (!session) return;
-        this.database.ingest({ ...event, session_id: session.id });
-        this.queueUserProfile(event.user);
-        connection.sessionId = session.id;
+        const matchedUid = String(event.user?.uid || "").startsWith("guest:")
+          ? this.database.findUniqueUserUidByUsername(event.user.username)
+          : null;
+        const user = matchedUid ? { ...event.user, uid: matchedUid } : event.user;
+        if (session) this.database.ingest({ ...event, user, session_id: session.id });
+        else this.database.ingestWaiting(room.id, { ...event, user });
+        this.queueUserProfile(user);
+        connection.sessionId = session?.id || null;
         recordEvent();
       } catch (error) {
         reportError(error);
@@ -490,6 +541,25 @@ export class DanmakuCollector {
         if (!isCurrent()) return;
         clearHandshakeTimer(); connection.status = "listening"; connection.connectedAt ||= new Date().toISOString(); connection.lastError = ""; this.cancelPendingRecovery(connection);
         this.logger.info?.(`[danmaku] listening room ${room.room_number}, uid ${parseBilibiliCookie(this.config.value.security.bilibili_cookie).uid || 0}`);
+      },
+      onLiveStart: (message) => {
+        if (!isCurrent()) return;
+        try {
+          ensureSession(toIsoTimestamp(message.timestamp));
+          recordActivity();
+        } catch (error) {
+          reportError(error);
+        }
+      },
+      onLiveEnd: (message) => {
+        if (!isCurrent()) return;
+        try {
+          this.database.endLiveSessionFromEvent(room.id, toIsoTimestamp(message.timestamp));
+          connection.sessionId = null;
+          recordActivity();
+        } catch (error) {
+          reportError(error);
+        }
       },
       onClose: () => { if (!isCurrent()) return; clearHandshakeTimer(); this.scheduleRecovery(connection, "连接已关闭", "closed"); },
       onError: reportError,
@@ -612,7 +682,7 @@ export class DanmakuCollector {
       const auth = parseBilibiliCookie(cookie);
       connection.instance = this.listenerFactory(Number(room.room_number), handler, {
         ws: {
-          keepalive: false,
+          keepalive: true,
           uid: auth.uid,
           ...(auth.buvid ? { buvid: auth.buvid } : {}),
           headers: {

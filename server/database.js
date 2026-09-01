@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS rooms (
   avatar_url TEXT NOT NULL DEFAULT '',
   description TEXT NOT NULL DEFAULT '',
   enabled INTEGER NOT NULL DEFAULT 1,
+  waiting_monitor_enabled INTEGER NOT NULL DEFAULT 0,
   sort_order INTEGER NOT NULL DEFAULT 0,
   bili_uid TEXT,
   live_status INTEGER NOT NULL DEFAULT 0,
@@ -25,6 +26,10 @@ CREATE TABLE IF NOT EXISTS rooms (
   room_area TEXT NOT NULL DEFAULT '',
   room_parent_area TEXT NOT NULL DEFAULT '',
   claim_key TEXT NOT NULL DEFAULT '',
+  bark_device_token TEXT NOT NULL DEFAULT '',
+  bark_server_url TEXT NOT NULL DEFAULT 'https://api.day.app',
+  bark_title TEXT NOT NULL DEFAULT '',
+  bark_body TEXT NOT NULL DEFAULT '',
   attention INTEGER NOT NULL DEFAULT 0,
   online INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
@@ -90,6 +95,44 @@ CREATE TABLE IF NOT EXISTS gifts (
   trade_id TEXT UNIQUE
 );
 
+CREATE TABLE IF NOT EXISTS waiting_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  room_id INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+  session_id INTEGER REFERENCES live_sessions(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  event_type TEXT NOT NULL CHECK(event_type IN ('enter', 'danmaku', 'gift')),
+  content TEXT NOT NULL DEFAULT '',
+  medal_name TEXT NOT NULL DEFAULT '',
+  medal_level INTEGER NOT NULL DEFAULT 0,
+  is_superchat INTEGER NOT NULL DEFAULT 0,
+  superchat_price REAL NOT NULL DEFAULT 0,
+  gift_name TEXT NOT NULL DEFAULT '',
+  gift_icon_url TEXT NOT NULL DEFAULT '',
+  gift_count INTEGER NOT NULL DEFAULT 0,
+  unit_price REAL NOT NULL DEFAULT 0,
+  total_value REAL NOT NULL DEFAULT 0,
+  trade_id TEXT UNIQUE,
+  occurred_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS session_supplement_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id INTEGER NOT NULL REFERENCES live_sessions(id) ON DELETE CASCADE,
+  batch_id TEXT NOT NULL,
+  sequence_no INTEGER NOT NULL,
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  username TEXT NOT NULL,
+  content TEXT NOT NULL,
+  occurred_at TEXT,
+  source_kind TEXT NOT NULL CHECK(source_kind IN ('ocr', 'ocr+xml')),
+  xml_username TEXT NOT NULL DEFAULT '',
+  xml_offset_seconds REAL,
+  created_at TEXT NOT NULL,
+  deleted_at TEXT,
+  UNIQUE(session_id, sequence_no)
+);
+
 CREATE TABLE IF NOT EXISTS room_user_notes (
   room_id INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -111,9 +154,15 @@ CREATE INDEX IF NOT EXISTS idx_gifts_session_received ON gifts(session_id, recei
 CREATE INDEX IF NOT EXISTS idx_session_users_messages ON session_users(session_id, message_count DESC);
 CREATE INDEX IF NOT EXISTS idx_room_user_notes_updated ON room_user_notes(room_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_room_claim_managers_uid ON room_claim_managers(bili_uid);
+CREATE INDEX IF NOT EXISTS idx_waiting_events_room_unassigned ON waiting_events(room_id, session_id, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_waiting_events_session_type ON waiting_events(session_id, event_type, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_supplement_events_session_sequence ON session_supplement_events(session_id, sequence_no);
+CREATE INDEX IF NOT EXISTS idx_supplement_events_batch ON session_supplement_events(session_id, batch_id);
 `;
 
 const now = () => new Date().toISOString();
+const DANMAKU_SESSION_NOTE = "由 Bilibili 弹幕监听器实时创建";
+const DANMAKU_SESSION_CONFIRM_GRACE_MS = 2 * 60_000;
 const randomBase36 = (length) => crypto.randomBytes(length * 2).toString("base64")
   .toLowerCase()
   .replace(/[^a-z0-9]/g, "")
@@ -154,10 +203,17 @@ export class ArchiveDatabase {
       ["attention", "INTEGER NOT NULL DEFAULT 0"],
       ["online", "INTEGER NOT NULL DEFAULT 0"],
       ["sort_order", "INTEGER NOT NULL DEFAULT 0"],
+      ["bark_device_token", "TEXT NOT NULL DEFAULT ''"],
+      ["bark_server_url", "TEXT NOT NULL DEFAULT 'https://api.day.app'"],
+      ["bark_title", "TEXT NOT NULL DEFAULT ''"],
+      ["bark_body", "TEXT NOT NULL DEFAULT ''"],
+      ["waiting_monitor_enabled", "INTEGER NOT NULL DEFAULT 0"],
     ];
     for (const [name, definition] of additions) {
       if (!roomColumns.has(name)) this.db.exec(`ALTER TABLE rooms ADD COLUMN ${name} ${definition}`);
     }
+    const supplementColumns = new Set(this.db.prepare("PRAGMA table_info(session_supplement_events)").all().map((column) => column.name));
+    if (!supplementColumns.has("deleted_at")) this.db.exec("ALTER TABLE session_supplement_events ADD COLUMN deleted_at TEXT");
     const danmakuColumns = new Set(this.db.prepare("PRAGMA table_info(danmaku)").all().map((column) => column.name));
     const needsSuperchatBackfill = !danmakuColumns.has("is_superchat") || !danmakuColumns.has("superchat_price");
     if (!danmakuColumns.has("is_superchat")) this.db.exec("ALTER TABLE danmaku ADD COLUMN is_superchat INTEGER NOT NULL DEFAULT 0");
@@ -210,8 +266,8 @@ export class ArchiveDatabase {
       roomById: this.db.prepare("SELECT * FROM rooms WHERE id = ?"),
       roomClaimKeyExists: this.db.prepare("SELECT 1 FROM rooms WHERE claim_key = ?").pluck(),
       insertRoom: this.db.prepare(`
-        INSERT INTO rooms (room_number, alias, streamer_name, avatar_url, description, enabled, sort_order, claim_key, created_at, updated_at)
-        VALUES (@room_number, NULLIF(@alias, ''), @streamer_name, @avatar_url, @description, @enabled, @sort_order, @claim_key, @created_at, @updated_at)
+        INSERT INTO rooms (room_number, alias, streamer_name, avatar_url, description, enabled, waiting_monitor_enabled, sort_order, claim_key, bark_device_token, bark_server_url, bark_title, bark_body, created_at, updated_at)
+        VALUES (@room_number, NULLIF(@alias, ''), @streamer_name, @avatar_url, @description, @enabled, @waiting_monitor_enabled, @sort_order, @claim_key, @bark_device_token, @bark_server_url, @bark_title, @bark_body, @created_at, @updated_at)
       `),
       deleteRoom: this.db.prepare("DELETE FROM rooms WHERE id = ?"),
       insertSession: this.db.prepare(`
@@ -244,6 +300,14 @@ export class ArchiveDatabase {
         ORDER BY id ASC LIMIT ?
       `),
       userAvatarByUid: this.db.prepare("SELECT avatar_url FROM users WHERE bili_uid = ?"),
+      numericUserUidsByUsername: this.db.prepare(`
+        SELECT bili_uid FROM users
+        WHERE username = @username
+          AND bili_uid != ''
+          AND bili_uid NOT GLOB '*[^0-9]*'
+          AND bili_uid NOT GLOB '0*'
+        ORDER BY id ASC LIMIT 2
+      `),
       userId: this.db.prepare("SELECT id FROM users WHERE bili_uid = ?"),
       sessionExists: this.db.prepare("SELECT 1 FROM live_sessions WHERE id = ?"),
       ensureSessionUser: this.db.prepare(`
@@ -274,6 +338,28 @@ export class ArchiveDatabase {
         INSERT INTO gifts
           (session_id, user_id, gift_name, gift_icon_url, count, unit_price, total_value, received_at, trade_id)
         VALUES (@session_id, @user_id, @gift_name, @gift_icon_url, @count, @unit_price, @total_value, @timestamp, NULLIF(@trade_id, ''))
+      `),
+      insertWaitingEvent: this.db.prepare(`
+        INSERT INTO waiting_events
+          (room_id, session_id, user_id, event_type, content, medal_name, medal_level,
+           is_superchat, superchat_price, gift_name, gift_icon_url, gift_count,
+           unit_price, total_value, trade_id, occurred_at, created_at)
+        VALUES
+          (@room_id, NULL, @user_id, @event_type, @content, @medal_name, @medal_level,
+           @is_superchat, @superchat_price, @gift_name, @gift_icon_url, @gift_count,
+           @unit_price, @total_value, NULLIF(@trade_id, ''), @occurred_at, @created_at)
+      `),
+      attachWaitingEvents: this.db.prepare(`
+        UPDATE waiting_events SET session_id = @session_id
+        WHERE room_id = @room_id AND session_id IS NULL
+      `),
+      insertSupplementEvent: this.db.prepare(`
+        INSERT INTO session_supplement_events
+          (session_id, batch_id, sequence_no, user_id, username, content, occurred_at,
+           source_kind, xml_username, xml_offset_seconds, created_at)
+        VALUES
+          (@session_id, @batch_id, @sequence_no, @user_id, @username, @content, @occurred_at,
+           @source_kind, @xml_username, @xml_offset_seconds, @created_at)
       `),
       upsertRoomUserNote: this.db.prepare(`
         INSERT INTO room_user_notes (room_id, user_id, note, updated_at)
@@ -335,6 +421,32 @@ export class ArchiveDatabase {
       });
       return { id: Number(result.lastInsertRowid), type: "gift" };
     });
+
+    this.ingestWaitingTransaction = this.db.transaction((roomId, event) => {
+      if (!this.getRoomById(Number(roomId))) throw new Error("房间不存在");
+      const user = { ...event.user, updated_at: now() };
+      this.statements.upsertUser.run(user);
+      const userId = this.statements.userId.get(user.uid).id;
+      const result = this.statements.insertWaitingEvent.run({
+        room_id: Number(roomId),
+        user_id: userId,
+        event_type: event.type,
+        content: String(event.content || ""),
+        medal_name: String(event.medal_name || ""),
+        medal_level: Number(event.medal_level || 0),
+        is_superchat: Number(Boolean(event.is_superchat)),
+        superchat_price: Number(event.superchat_price || 0),
+        gift_name: String(event.gift_name || ""),
+        gift_icon_url: String(event.gift_icon_url || ""),
+        gift_count: event.type === "gift" ? Math.max(1, Number(event.count || 1)) : 0,
+        unit_price: Number(event.unit_price || 0),
+        total_value: event.type === "gift" ? Math.round(Number(event.count || 1) * Number(event.unit_price || 0) * 100) / 100 : 0,
+        trade_id: String(event.trade_id || ""),
+        occurred_at: event.timestamp || now(),
+        created_at: now(),
+      });
+      return { id: Number(result.lastInsertRowid), type: event.type, waiting: true };
+    });
   }
 
   close() {
@@ -342,7 +454,7 @@ export class ArchiveDatabase {
   }
 
   counts() {
-    return Object.fromEntries(["rooms", "live_sessions", "users", "session_users", "danmaku", "gifts"]
+    return Object.fromEntries(["rooms", "live_sessions", "users", "session_users", "danmaku", "gifts", "waiting_events", "session_supplement_events"]
       .map((table) => [table, this.db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count]));
   }
 
@@ -375,6 +487,21 @@ export class ArchiveDatabase {
     return this.db.prepare("SELECT * FROM rooms WHERE enabled = 1 ORDER BY id").all();
   }
 
+  listDanmakuMonitorRooms() {
+    return this.db.prepare(`
+      SELECT * FROM rooms
+      WHERE enabled = 1 AND (
+        waiting_monitor_enabled = 1
+        OR live_status = 1
+        OR EXISTS (
+          SELECT 1 FROM live_sessions
+          WHERE live_sessions.room_id = rooms.id AND live_sessions.status = 'live'
+        )
+      )
+      ORDER BY id
+    `).all();
+  }
+
   listLiveRoomsWithSessions() {
     return this.db.prepare(`
       SELECT r.*, s.id AS session_id, s.started_at AS session_started_at
@@ -395,6 +522,43 @@ export class ArchiveDatabase {
     ).get(roomId) || null;
   }
 
+  ensureLiveSessionFromEvent(roomId, startedAt = now()) {
+    const ensure = this.db.transaction(() => {
+      const room = this.getRoomById(Number(roomId));
+      if (!room || !Number(room.enabled)) return null;
+      const activeSession = this.getActiveSessionForRoom(room.id);
+      if (activeSession) return activeSession;
+      return this.createSession(room.id, {
+        title: room.room_title || `${room.streamer_name || `直播间 ${room.room_number}`} 的直播`,
+        cover_url: room.room_cover_url || "",
+        area: room.room_area || "",
+        parent_area: room.room_parent_area || "",
+        started_at: startedAt || now(),
+        ended_at: "",
+        status: "live",
+        peak_popularity: Number(room.online || 0),
+        note: DANMAKU_SESSION_NOTE,
+      });
+    });
+    return ensure();
+  }
+
+  endLiveSessionFromEvent(roomId, endedAt = now()) {
+    const end = this.db.transaction(() => {
+      const numericRoomId = Number(roomId);
+      const timestamp = endedAt || now();
+      this.db.prepare("UPDATE rooms SET live_status = 0, updated_at = ? WHERE id = ?")
+        .run(timestamp, numericRoomId);
+      const activeSession = this.getActiveSessionForRoom(numericRoomId);
+      if (!activeSession) return null;
+      return this.updateSession(activeSession.id, {
+        status: "ended",
+        ended_at: timestamp,
+      });
+    });
+    return end();
+  }
+
   createRoom(input) {
     const timestamp = now();
     const nextOrder = this.db.prepare("SELECT COALESCE(MAX(sort_order), -1) + 1 AS value FROM rooms").get().value;
@@ -404,6 +568,11 @@ export class ArchiveDatabase {
       ...input,
       streamer_name: input.streamer_name || `直播间 ${input.room_number}`,
       enabled: Number(input.enabled),
+      waiting_monitor_enabled: Number(Boolean(input.waiting_monitor_enabled)),
+      bark_device_token: input.bark_device_token || "",
+      bark_server_url: input.bark_server_url || "https://api.day.app",
+      bark_title: input.bark_title || "",
+      bark_body: input.bark_body || "",
       sort_order: nextOrder,
       claim_key: claimKey,
       created_at: timestamp,
@@ -413,13 +582,14 @@ export class ArchiveDatabase {
   }
 
   updateRoom(id, input) {
-    const allowed = ["room_number", "alias", "streamer_name", "avatar_url", "description", "enabled"];
+    const allowed = ["room_number", "alias", "streamer_name", "avatar_url", "description", "enabled", "waiting_monitor_enabled", "bark_device_token", "bark_server_url", "bark_title", "bark_body"];
     const entries = Object.entries(input).filter(([key]) => allowed.includes(key));
     if (!entries.length) return this.getRoomById(id);
     const assignments = entries.map(([key]) => `${key} = @${key}`).concat("updated_at = @updated_at");
     const values = Object.fromEntries(entries);
     if ("alias" in values) values.alias = values.alias || null;
     if ("enabled" in values) values.enabled = Number(values.enabled);
+    if ("waiting_monitor_enabled" in values) values.waiting_monitor_enabled = Number(values.waiting_monitor_enabled);
     const result = this.db.prepare(`UPDATE rooms SET ${assignments.join(", ")} WHERE id = @id`)
       .run({ ...values, updated_at: now(), id });
     return result.changes ? this.getRoomById(id) : null;
@@ -451,7 +621,11 @@ export class ArchiveDatabase {
       ended_at: input.ended_at || "",
       created_at: now(),
     });
-    return this.getSession(Number(result.lastInsertRowid));
+    const sessionId = Number(result.lastInsertRowid);
+    if (input.status === "live") {
+      this.statements.attachWaitingEvents.run({ room_id: Number(roomId), session_id: sessionId });
+    }
+    return this.getSession(sessionId);
   }
 
   updateSession(id, input) {
@@ -557,6 +731,140 @@ export class ArchiveDatabase {
     return { items, total, min_messages: minMessages, limit, offset, sort_by: sortBy, order };
   }
 
+  waitingEventReport(sessionId, { includeNotes = false } = {}) {
+    const session = this.getSession(Number(sessionId));
+    if (!session) return null;
+    const note = includeNotes ? "COALESCE(run.note, '')" : "''";
+    const counts = this.db.prepare(`
+      SELECT
+        SUM(CASE WHEN event_type = 'gift' THEN 1 ELSE 0 END) AS gift_count,
+        SUM(CASE WHEN event_type = 'danmaku' THEN 1 ELSE 0 END) AS danmaku_count,
+        SUM(CASE WHEN event_type = 'enter' THEN 1 ELSE 0 END) AS entry_count,
+        COUNT(DISTINCT user_id) AS user_count
+      FROM waiting_events WHERE session_id = ?
+    `).get(session.id);
+    const danmaku = this.db.prepare(`
+      SELECT we.id, we.content, we.medal_name, we.medal_level, we.is_superchat,
+        we.superchat_price, we.occurred_at AS sent_at, u.bili_uid, u.username,
+        u.avatar_url, u.guard_level, ${note} AS room_note
+      FROM waiting_events we
+      JOIN users u ON u.id = we.user_id
+      LEFT JOIN room_user_notes run ON run.room_id = we.room_id AND run.user_id = we.user_id
+      WHERE we.session_id = ? AND we.event_type = 'danmaku'
+      ORDER BY we.occurred_at ASC, we.id ASC
+    `).all(session.id);
+    const gifts = this.db.prepare(`
+      SELECT we.id, we.gift_name, we.gift_icon_url, we.gift_count AS count,
+        we.unit_price, we.total_value, we.trade_id, we.occurred_at AS received_at,
+        u.bili_uid, u.username, u.avatar_url, u.guard_level, ${note} AS room_note
+      FROM waiting_events we
+      JOIN users u ON u.id = we.user_id
+      LEFT JOIN room_user_notes run ON run.room_id = we.room_id AND run.user_id = we.user_id
+      WHERE we.session_id = ? AND we.event_type = 'gift'
+      ORDER BY we.occurred_at ASC, we.id ASC
+    `).all(session.id);
+    const viewers = this.db.prepare(`
+      SELECT u.bili_uid, u.username, u.avatar_url, u.guard_level, ${note} AS room_note,
+        MIN(we.occurred_at) AS first_entered_at,
+        MAX(we.occurred_at) AS last_entered_at,
+        SUM(CASE WHEN we.event_type = 'enter' THEN 1 ELSE 0 END) AS entry_count,
+        SUM(CASE WHEN we.event_type = 'danmaku' THEN 1 ELSE 0 END) AS message_count,
+        COUNT(we.id) AS event_count
+      FROM waiting_events we
+      JOIN users u ON u.id = we.user_id
+      LEFT JOIN room_user_notes run ON run.room_id = we.room_id AND run.user_id = we.user_id
+      WHERE we.session_id = ?
+      GROUP BY we.user_id
+      ORDER BY first_entered_at ASC, we.user_id ASC
+    `).all(session.id);
+    return {
+      session_id: session.id,
+      counts: Object.fromEntries(Object.entries(counts).map(([key, value]) => [key, Number(value || 0)])),
+      gifts,
+      danmaku,
+      viewers,
+    };
+  }
+
+  importSupplementEvents(sessionId, items) {
+    const importBatch = this.db.transaction(() => {
+      const session = this.getSession(Number(sessionId));
+      if (!session) throw new Error("场次不存在");
+      if (!items.length) throw new Error("没有识别出可补充的记录");
+      const batchId = crypto.randomUUID();
+      const createdAt = now();
+      let sequence = Number(this.db.prepare(`
+        SELECT COALESCE(MAX(sequence_no), 0) AS value
+        FROM session_supplement_events WHERE session_id = ?
+      `).get(session.id).value);
+      let matchedTimeCount = 0;
+      let matchedUidCount = 0;
+      for (const item of items) {
+        const matchedUid = this.findUniqueUserUidByUsername(item.username);
+        const userId = matchedUid ? (this.statements.userId.get(matchedUid)?.id || null) : null;
+        sequence += 1;
+        if (item.occurred_at) matchedTimeCount += 1;
+        if (userId) matchedUidCount += 1;
+        this.statements.insertSupplementEvent.run({
+          session_id: session.id,
+          batch_id: batchId,
+          sequence_no: sequence,
+          user_id: userId,
+          username: String(item.username).trim(),
+          content: String(item.content).trim(),
+          occurred_at: item.occurred_at || null,
+          source_kind: item.source_kind === "ocr+xml" ? "ocr+xml" : "ocr",
+          xml_username: String(item.xml_username || "").trim(),
+          xml_offset_seconds: Number.isFinite(Number(item.xml_offset_seconds)) ? Number(item.xml_offset_seconds) : null,
+          created_at: createdAt,
+        });
+      }
+      return {
+        batch_id: batchId,
+        imported_count: items.length,
+        matched_time_count: matchedTimeCount,
+        matched_uid_count: matchedUidCount,
+        first_sequence_no: sequence - items.length + 1,
+        last_sequence_no: sequence,
+      };
+    });
+    return importBatch();
+  }
+
+  supplementEventReport(sessionId, { includeNotes = false } = {}) {
+    const session = this.getSession(Number(sessionId));
+    if (!session) return null;
+    const note = includeNotes ? "COALESCE(run.note, '')" : "''";
+    const items = this.db.prepare(`
+      SELECT se.*, COALESCE(u.bili_uid, '') AS bili_uid, COALESCE(u.avatar_url, '') AS avatar_url,
+        ${note} AS room_note
+      FROM session_supplement_events se
+      LEFT JOIN users u ON u.id = se.user_id
+      LEFT JOIN room_user_notes run ON run.room_id = ? AND run.user_id = se.user_id
+      WHERE se.session_id = ? AND se.deleted_at IS NULL
+      ORDER BY se.sequence_no ASC, se.id ASC
+    `).all(session.room_id, session.id).map((item) => ({ ...item, room_note: includeNotes ? item.room_note : "" }));
+    const batches = this.db.prepare(`
+      SELECT batch_id, MIN(sequence_no) AS first_sequence_no, MAX(sequence_no) AS last_sequence_no,
+        COUNT(*) AS item_count, SUM(CASE WHEN occurred_at IS NOT NULL THEN 1 ELSE 0 END) AS matched_time_count,
+        MIN(created_at) AS created_at
+      FROM session_supplement_events WHERE session_id = ? AND deleted_at IS NULL
+      GROUP BY batch_id ORDER BY first_sequence_no ASC
+    `).all(session.id).map((batch) => ({
+      ...batch,
+      item_count: Number(batch.item_count || 0),
+      matched_time_count: Number(batch.matched_time_count || 0),
+    }));
+    return { session_id: session.id, items, batches, total: items.length };
+  }
+
+  deleteSupplementBatch(sessionId, batchId) {
+    return this.db.prepare(`
+      UPDATE session_supplement_events SET deleted_at = ?
+      WHERE session_id = ? AND batch_id = ? AND deleted_at IS NULL
+    `).run(now(), Number(sessionId), String(batchId)).changes;
+  }
+
   saveRoomUserNote(roomId, biliUid, note) {
     const room = this.getRoomById(Number(roomId));
     if (!room) return null;
@@ -584,6 +892,10 @@ export class ArchiveDatabase {
 
   ingest(event) {
     return this.ingestTransaction(event);
+  }
+
+  ingestWaiting(roomId, event) {
+    return this.ingestWaitingTransaction(roomId, event);
   }
 
   listRoomClaimManagers(roomId) {
@@ -639,6 +951,13 @@ export class ArchiveDatabase {
     return Boolean(this.statements.userAvatarByUid.get(String(uid))?.avatar_url);
   }
 
+  findUniqueUserUidByUsername(username) {
+    const normalized = String(username || "").trim();
+    if (!normalized || normalized === "匿名观众") return null;
+    const matches = this.statements.numericUserUidsByUsername.all({ username: normalized });
+    return matches.length === 1 ? String(matches[0].bili_uid) : null;
+  }
+
   recordRoomSyncError(roomId, message) {
     this.db.prepare(`
       UPDATE rooms SET last_checked_at = ?, last_sync_error = ?, updated_at = ? WHERE id = ?
@@ -651,6 +970,7 @@ export class ArchiveDatabase {
       const room = this.getRoomById(roomId);
       if (!room) throw new Error("房间不存在");
       const timestamp = now();
+      const wasLive = Number(room.live_status || 0) === 1;
       this.db.prepare(`
         UPDATE rooms SET
           room_number = @room_number,
@@ -692,14 +1012,16 @@ export class ArchiveDatabase {
       ).get(roomId);
       let session = activeSession || null;
       if (snapshot.live_status === 1) {
+        const createdFromDanmaku = activeSession?.note === DANMAKU_SESSION_NOTE;
         const sessionData = {
           title: snapshot.title || "未命名直播",
           cover_url: snapshot.cover_url || "",
           area: snapshot.area || "",
           parent_area: snapshot.parent_area || "",
+          ...(createdFromDanmaku && snapshot.live_time ? { started_at: snapshot.live_time } : {}),
           status: "live",
           peak_popularity: Math.max(Number(activeSession?.peak_popularity || 0), Number(snapshot.online || 0)),
-          note: activeSession?.note || "由 Bilibili 房间监视器自动创建",
+          note: createdFromDanmaku ? "由 Bilibili 房间监视器自动创建" : (activeSession?.note || "由 Bilibili 房间监视器自动创建"),
         };
         session = activeSession
           ? this.updateSession(activeSession.id, sessionData)
@@ -709,9 +1031,13 @@ export class ArchiveDatabase {
               ended_at: "",
             });
       } else if (activeSession) {
-        session = this.updateSession(activeSession.id, { status: "ended", ended_at: timestamp });
+        const awaitingHttpConfirmation = activeSession.note === DANMAKU_SESSION_NOTE
+          && Date.parse(timestamp) - Date.parse(activeSession.created_at) < DANMAKU_SESSION_CONFIRM_GRACE_MS;
+        if (!awaitingHttpConfirmation) {
+          session = this.updateSession(activeSession.id, { status: "ended", ended_at: timestamp });
+        }
       }
-      return { room: this.getRoomById(roomId), session, snapshot };
+      return { room: this.getRoomById(roomId), session, snapshot, wentLive: !wasLive && Number(snapshot.live_status || 0) === 1 };
     });
     return apply();
   }

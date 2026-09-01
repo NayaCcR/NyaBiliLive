@@ -138,12 +138,14 @@ function openRoomModal(room = null) {
     modal.querySelector("#room-modal-title").textContent = "编辑直播间";
     for (const key of ["room_number", "alias", "streamer_name", "avatar_url", "description"]) form.elements[key].value = room[key] || "";
     form.elements.enabled.checked = Boolean(room.enabled);
+    form.elements.waiting_monitor_enabled.checked = Boolean(room.waiting_monitor_enabled);
   }
   bindModalClose(modal);
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     const data = Object.fromEntries(new FormData(form));
     data.enabled = form.elements.enabled.checked;
+    data.waiting_monitor_enabled = form.elements.waiting_monitor_enabled.checked;
     try {
       await api(room ? `/api/admin/rooms/${room.id}` : "/api/admin/rooms", { method: room ? "PATCH" : "POST", body: JSON.stringify(data) });
       modal.remove(); await loadRooms(); renderRooms(); toast(room ? "房间信息已更新" : "直播间已添加");

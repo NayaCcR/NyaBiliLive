@@ -1,5 +1,5 @@
 const overviewCollapsed = (() => { try { return localStorage.getItem("nyabililive:overview-collapsed") === "true"; } catch { return false; } })();
-const state = { config: null, auth: null, authenticated: false, roomAuthenticated: false, room: null, session: null, activeTab: "gifts", danmakuOffset: 0, danmakuOrder: "desc", danmakuSuperchat: "all", viewerOffset: 0, viewerSort: "last_entered_at", viewerOrder: "desc", viewerData: null, viewerEditingUid: null, viewerNoteDraft: "", viewerNoteSavingUid: null, durationTimer: null, liveRefreshTimer: null, liveRefreshInFlight: false, liveRefreshGeneration: 0, danmakuRenderedOnce: false, danmakuSignature: "", viewerSignature: "", overviewCollapsed, giftData: null, giftSignature: "", giftMode: "overview", giftUserId: null, giftHistoryOrder: "desc" };
+const state = { config: null, auth: null, authenticated: false, roomAuthenticated: false, room: null, session: null, activeTab: "gifts", danmakuOffset: 0, danmakuOrder: "desc", danmakuSuperchat: "all", viewerOffset: 0, viewerSort: "last_entered_at", viewerOrder: "desc", viewerData: null, viewerEditingUid: null, viewerNoteDraft: "", viewerNoteSavingUid: null, durationTimer: null, liveRefreshTimer: null, liveRefreshInFlight: false, liveRefreshGeneration: 0, danmakuRenderedOnce: false, danmakuSignature: "", viewerSignature: "", overviewCollapsed, giftData: null, giftSignature: "", giftMode: "overview", giftUserId: null, giftHistoryOrder: "desc", waitingMode: "gifts" };
 const app = document.querySelector("#app");
 const escapeHtml = (value = "") => String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;");
 const count = (value) => new Intl.NumberFormat("zh-CN").format(Number(value || 0));
@@ -219,6 +219,7 @@ async function loadActiveTab() {
   if (!state.session) return;
   if (state.activeTab === "danmaku") await loadDanmaku();
   if (state.activeTab === "viewers") await loadViewers();
+  if (state.activeTab === "waiting") await loadWaitingEvents();
 }
 
 function stopLiveRefresh() {
@@ -459,6 +460,164 @@ async function loadViewers(reset = false, { silent = false, sessionId = state.se
       input.select();
     });
     state.viewerSignature = signature;
+  } catch (error) { panel.innerHTML = `<div class="empty-inline error">${escapeHtml(error.message)}</div>`; }
+}
+
+function waitingDanmakuRows(items) {
+  return items.map((item) => `<article class="danmaku-row${item.is_superchat ? " superchat" : ""}">${userAvatar(item)}<div><header>${usernameWithNote(item, { medal: item.medal_name ? `<span class="medal">${escapeHtml(item.medal_name)} ${item.medal_level}</span>` : "" })}<time>${formatTimestamp(item.sent_at)}</time></header><p>${escapeHtml(item.content)}</p>${item.is_superchat ? `<span class="superchat-batteries">${batteries(item.superchat_price)}</span>` : ""}</div></article>`).join("") || '<div class="empty-inline">本场直播前没有捕获到候场弹幕</div>';
+}
+
+function waitingViewerRows(items) {
+  return items.map((item) => `<tr><td><span class="user-cell">${userAvatar(item)}<span class="viewer-name-stack">${noteBadge(item)}<strong>${escapeHtml(item.username)}</strong></span></span></td><td class="viewer-uid-column"><span class="viewer-uid-value">${escapeHtml(item.bili_uid)}</span></td><td>${formatTimestamp(item.first_entered_at)}</td><td>${count(item.entry_count)}</td><td><strong>${count(item.message_count)}</strong></td><td>${count(item.event_count)}</td></tr>`).join("") || '<tr><td colspan="6" class="empty-cell">本场直播前没有捕获到候场用户</td></tr>';
+}
+
+function decodeXmlEntities(value) {
+  const entities = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" };
+  return String(value || "").replace(/&(#x[\da-f]+|#\d+|amp|lt|gt|quot|apos);/gi, (match, entity) => {
+    if (entity[0] === "#") {
+      const hexadecimal = entity[1]?.toLowerCase() === "x";
+      const code = Number.parseInt(entity.slice(hexadecimal ? 2 : 1), hexadecimal ? 16 : 10);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : match;
+    }
+    return entities[entity.toLowerCase()] || match;
+  });
+}
+
+function parseRecorderXml(text) {
+  const source = String(text || "");
+  if (!/<BililiveRecorderRecordInfo\b/i.test(source) && !/<d\b/i.test(source)) throw new Error("XML 中没有找到录播姬弹幕记录");
+  const startMatch = source.match(/<BililiveRecorderRecordInfo\b[^>]*\bstart_time="([^"]+)"/i);
+  const recordingStart = startMatch ? Date.parse(decodeXmlEntities(startMatch[1])) : NaN;
+  const events = [];
+  const matcher = /<d\b([^>]*)>([\s\S]*?)<\/d>/gi;
+  let match;
+  while ((match = matcher.exec(source))) {
+    const attributes = match[1];
+    const p = attributes.match(/\bp="([^"]*)"/i)?.[1]?.split(",") || [];
+    const offsetSeconds = Number(p[0]);
+    const rawTimestamp = Number(p[4]);
+    const timestamp = Number.isFinite(rawTimestamp) && rawTimestamp > 0
+      ? (rawTimestamp < 1_000_000_000_000 ? rawTimestamp * 1000 : rawTimestamp)
+      : (Number.isFinite(recordingStart) && Number.isFinite(offsetSeconds) ? recordingStart + offsetSeconds * 1000 : NaN);
+    const occurredAt = Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : "";
+    const content = decodeXmlEntities(match[2]).trim();
+    if (!occurredAt || !content) continue;
+    events.push({
+      username: decodeXmlEntities(attributes.match(/\buser="([^"]*)"/i)?.[1] || "").trim(),
+      content,
+      occurred_at: occurredAt,
+      offset_seconds: Number.isFinite(offsetSeconds) && offsetSeconds >= 0 ? offsetSeconds : null,
+    });
+    if (events.length > 20_000) throw new Error("XML 弹幕超过 20000 条，请裁剪到需要补录的时间段后重试");
+  }
+  if (!events.length) throw new Error("XML 中没有可用于匹配的普通弹幕");
+  return events;
+}
+
+function supplementRows(items) {
+  return items.map((item) => `<article class="danmaku-row supplement-row">${userAvatar(item)}<span class="supplement-sequence">#${String(item.sequence_no).padStart(4, "0")}</span><div><header>${usernameWithNote(item)}${item.bili_uid ? `<span class="supplement-uid">UID ${escapeHtml(item.bili_uid)}</span>` : ""}<time>${item.occurred_at ? formatTimestamp(item.occurred_at) : "仅保留顺序"}</time></header><p>${escapeHtml(item.content)}</p><small class="supplement-source">${item.source_kind === "ocr+xml" ? `OCR + XML 时间匹配${item.xml_username ? ` · XML 昵称 ${escapeHtml(item.xml_username)}` : ""}` : "仅 OCR · 无推测时间戳"}</small></div></article>`).join("") || '<div class="empty-inline">还没有手动补充记录</div>';
+}
+
+function supplementImporter() {
+  if (!state.roomAuthenticated) return "";
+  return `<form class="supplement-importer" id="supplement-import-form"><header><div><p class="kicker">MANUAL RECOVERY</p><h4>OCR / XML 补录</h4></div><span>管理者可用</span></header><div class="supplement-input-grid"><label><strong>1. OCR 截图</strong><input id="supplement-images" type="file" accept="image/png,image/jpeg,image/webp,image/bmp" multiple><small>可选择多张，按选择顺序识别；图片不会发送给第三方 OCR 服务。</small></label><button class="secondary-button" id="supplement-run-ocr" type="button">开始 OCR</button><label class="full"><strong>2. 检查识别文本</strong><textarea id="supplement-ocr-text" rows="9" placeholder="每条一行，例如：柳雪杨Naya：来了！"></textarea><small>可以直接粘贴或修改。只有“昵称：内容”格式会保存；没有 XML 时不会生成时间戳。</small></label><label class="full"><strong>3. 录播姬 XML（可选）</strong><input id="supplement-xml" type="file" accept=".xml,text/xml,application/xml"><small>仅用于按内容和遮罩昵称匹配真实时间，不会导入未匹配的 XML 记录。</small></label></div><footer><span id="supplement-progress">等待选择截图</span><button class="primary-button" type="submit">保存补充记录</button></footer></form>`;
+}
+
+function supplementView(data) {
+  const batches = data.batches.map((batch) => `<span class="supplement-batch"><b>#${batch.first_sequence_no}–#${batch.last_sequence_no}</b>${count(batch.item_count)} 条 · ${count(batch.matched_time_count)} 条匹配时间${state.roomAuthenticated ? `<button type="button" data-delete-supplement-batch="${escapeHtml(batch.batch_id)}">删除批次</button>` : ""}</span>`).join("");
+  return `${supplementImporter()}<section class="supplement-records"><header class="data-title"><div><p class="kicker">RECOVERED RECORDS</p><h3>补充记录</h3></div><span>${count(data.total)} 条</span></header>${batches ? `<div class="supplement-batches">${batches}</div>` : ""}<div class="danmaku-list">${supplementRows(data.items)}</div></section>`;
+}
+
+async function recognizeSupplementImages(panel) {
+  const files = [...panel.querySelector("#supplement-images").files];
+  if (!files.length) throw new Error("请先选择至少一张截图");
+  const button = panel.querySelector("#supplement-run-ocr");
+  const progress = panel.querySelector("#supplement-progress");
+  const output = panel.querySelector("#supplement-ocr-text");
+  button.disabled = true;
+  try {
+    const recognized = [];
+    for (const [index, file] of files.entries()) {
+      progress.textContent = `正在识别第 ${index + 1}/${files.length} 张…首次使用需下载中文模型`;
+      const result = await api(`/api/rooms/${state.room.id}/ocr`, {
+        method: "POST",
+        headers: { "Content-Type": file.type || "image/png" },
+        body: file,
+      });
+      recognized.push(result.text);
+    }
+    output.value = [output.value.trim(), recognized.join("\n")].filter(Boolean).join("\n");
+    progress.textContent = `OCR 完成，共 ${files.length} 张；请检查文本后保存`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function bindSupplementView(panel) {
+  const form = panel.querySelector("#supplement-import-form");
+  panel.querySelectorAll("[data-delete-supplement-batch]").forEach((button) => button.addEventListener("click", async () => {
+    if (!confirm("确定删除这一批补充记录吗？内部序号不会自动重排。")) return;
+    try {
+      await api(`/api/rooms/${state.room.id}/sessions/${state.session.id}/supplement-events/${encodeURIComponent(button.dataset.deleteSupplementBatch)}`, { method: "DELETE" });
+      await loadWaitingEvents();
+      toast("补录批次已删除");
+    } catch (error) { toast(error.message, "error"); }
+  }));
+  if (!form) return;
+  form.querySelector("#supplement-run-ocr").addEventListener("click", async () => {
+    try { await recognizeSupplementImages(panel); }
+    catch (error) { form.querySelector("#supplement-progress").textContent = error.message; toast(error.message, "error"); }
+  });
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const button = form.querySelector("button[type=submit]");
+    const progress = form.querySelector("#supplement-progress");
+    button.disabled = true;
+    try {
+      const xmlFile = form.querySelector("#supplement-xml").files[0];
+      progress.textContent = xmlFile ? "正在解析 XML 并匹配时间…" : "正在按 OCR 顺序保存…";
+      const xmlEvents = xmlFile ? parseRecorderXml(await xmlFile.text()) : [];
+      const result = await api(`/api/rooms/${state.room.id}/sessions/${state.session.id}/supplement-events`, {
+        method: "POST",
+        body: JSON.stringify({ ocr_text: form.querySelector("#supplement-ocr-text").value, xml_events: xmlEvents }),
+      });
+      toast(`已补充 ${result.imported_count} 条，${result.matched_time_count} 条匹配到 XML 时间`);
+      await loadWaitingEvents();
+    } catch (error) {
+      progress.textContent = error.message;
+      toast(error.message, "error");
+      button.disabled = false;
+    }
+  });
+}
+
+function renderWaitingEvents(data, supplements) {
+  const panel = document.querySelector("#panel-waiting");
+  if (!panel) return;
+  const views = {
+    gifts: `<section><header class="data-title"><div><p class="kicker">WAITING GIFTS</p><h3>候场礼物</h3></div><span>${count(data.counts.gift_count)} 条</span></header><div class="gift-history-list">${giftHistoryRows(data.gifts)}</div></section>`,
+    danmaku: `<section><header class="data-title"><div><p class="kicker">WAITING DANMAKU</p><h3>候场弹幕</h3></div><span>${count(data.counts.danmaku_count)} 条</span></header><div class="danmaku-list">${waitingDanmakuRows(data.danmaku)}</div></section>`,
+    viewers: `<section><header class="data-title"><div><p class="kicker">WAITING AUDIENCE</p><h3>候场进房用户</h3></div><span>${count(data.counts.user_count)} 位</span></header><div class="table-wrap"><table><thead><tr><th>用户</th><th class="viewer-uid-column">UID</th><th>首次出现</th><th>进入</th><th>发言</th><th>事件</th></tr></thead><tbody>${waitingViewerRows(data.viewers)}</tbody></table></div></section>`,
+    supplements: supplementView(supplements),
+  };
+  panel.innerHTML = `<div class="waiting-intro"><div><p class="kicker">PRE-LIVE ARCHIVE</p><h3>候场事件</h3><small>自动捕获的候场数据与手动补充的缺失记录都归在这里。</small></div><span>${count(data.counts.gift_count + data.counts.danmaku_count + data.counts.entry_count)} 条自动事件</span></div><nav class="segmented-control waiting-event-tabs" aria-label="候场事件类型"><button type="button" data-waiting-mode="gifts" class="${state.waitingMode === "gifts" ? "active" : ""}">礼物 ${count(data.counts.gift_count)}</button><button type="button" data-waiting-mode="danmaku" class="${state.waitingMode === "danmaku" ? "active" : ""}">弹幕 ${count(data.counts.danmaku_count)}</button><button type="button" data-waiting-mode="viewers" class="${state.waitingMode === "viewers" ? "active" : ""}">进房用户 ${count(data.counts.user_count)}</button><button type="button" data-waiting-mode="supplements" class="${state.waitingMode === "supplements" ? "active" : ""}">补充记录 ${count(supplements.total)}</button></nav><div class="waiting-event-view">${views[state.waitingMode] || views.gifts}</div>`;
+  panel.querySelectorAll("[data-waiting-mode]").forEach((button) => button.addEventListener("click", () => {
+    state.waitingMode = button.dataset.waitingMode;
+    renderWaitingEvents(data, supplements);
+  }));
+  if (state.waitingMode === "supplements") bindSupplementView(panel);
+}
+
+async function loadWaitingEvents({ sessionId = state.session?.id } = {}) {
+  const panel = document.querySelector("#panel-waiting");
+  panel.innerHTML = '<div class="panel-loading">整理候场事件…</div>';
+  try {
+    const [data, supplements] = await Promise.all([
+      api(`/api/sessions/${sessionId}/waiting-events`),
+      api(`/api/sessions/${sessionId}/supplement-events`),
+    ]);
+    if (state.session?.id !== sessionId) return;
+    renderWaitingEvents(data, supplements);
   } catch (error) { panel.innerHTML = `<div class="empty-inline error">${escapeHtml(error.message)}</div>`; }
 }
 
