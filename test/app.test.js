@@ -25,6 +25,53 @@ let ocrResponse;
 const defaultAdminPassword = "nya123nya321";
 const testAdminPassword = "test-admin-password-2026";
 
+function protobufVarint(value) {
+  let remaining = BigInt(value);
+  const bytes = [];
+  do {
+    let byte = Number(remaining & 0x7fn);
+    remaining >>= 7n;
+    if (remaining) byte |= 0x80;
+    bytes.push(byte);
+  } while (remaining);
+  return Buffer.from(bytes);
+}
+
+function protobufField(fieldNumber, wireType, value) {
+  const key = protobufVarint((BigInt(fieldNumber) << 3n) | BigInt(wireType));
+  if (wireType === 0) return Buffer.concat([key, protobufVarint(value)]);
+  const body = Buffer.isBuffer(value) ? value : Buffer.from(String(value), "utf8");
+  return Buffer.concat([key, protobufVarint(body.length), body]);
+}
+
+function encodeGiftV2Payload({ uid, uname, face = "", guardLevel = 0, gifts }) {
+  const root = [
+    protobufField(1, 0, uid),
+    protobufField(2, 2, uname),
+    protobufField(3, 2, face),
+    protobufField(5, 0, guardLevel),
+  ];
+  for (const gift of gifts) {
+    const giftInfo = protobufField(1, 2, gift.icon || "");
+    const item = Buffer.concat([
+      protobufField(1, 0, gift.id || 1),
+      protobufField(2, 2, gift.name),
+      protobufField(3, 0, gift.count),
+      protobufField(4, 0, gift.type || 0),
+      protobufField(5, 0, gift.price || 0),
+      protobufField(7, 0, gift.totalCoin || 0),
+      protobufField(8, 2, gift.coinType || "silver"),
+      protobufField(9, 2, gift.tid || ""),
+      protobufField(10, 0, gift.timestamp),
+      protobufField(12, 2, gift.rnd || ""),
+      protobufField(18, 2, gift.action || "投喂"),
+      protobufField(35, 2, giftInfo),
+    ]);
+    root.push(protobufField(10, 2, item));
+  }
+  return Buffer.concat(root).toString("base64");
+}
+
 async function loginAdmin() {
   const login = await agent.post("/api/auth/login")
     .send({ username: "admin", password: defaultAdminPassword })
@@ -602,16 +649,30 @@ describe("administration and ingestion", () => {
       raw: { tid: "waiting-gift-trade" },
       body: { timestamp: waitingAt + 2000, user, gift_name: "小花花", coin_type: "gold", price: 1000, amount: 2 },
     });
-
+    connection.handler.raw.SEND_GIFT_V2({
+      pb: encodeGiftV2Payload({
+        uid: user.uid,
+        uname: user.uname,
+        gifts: [{
+          id: 33988,
+          name: "候场人气票",
+          count: 42,
+          coinType: "silver",
+          timestamp: Math.floor((waitingAt + 3000) / 1000),
+          tid: "waiting-gift-v2-trade",
+        }],
+      }),
+    });
     let room = await request(app).get("/api/rooms/waiting-room").expect(200);
     assert.equal(room.body.sessions.length, 0, "候场事件不应提前创建直播场次");
-    assert.equal(app.locals.database.counts().waiting_events, 3);
+    assert.equal(app.locals.database.counts().waiting_events, 4);
     const pendingWaiting = await request(app).get("/api/rooms/waiting-room/waiting-events").expect(200);
     assert.equal(pendingWaiting.body.pending, true);
     assert.equal(pendingWaiting.body.session_id, null);
     assert.equal(pendingWaiting.body.live_status, 0);
     assert.equal(pendingWaiting.body.waiting_monitor_enabled, 1);
-    assert.deepEqual(pendingWaiting.body.counts, { gift_count: 1, danmaku_count: 1, entry_count: 1, user_count: 1 });
+    assert.deepEqual(pendingWaiting.body.counts, { gift_count: 2, danmaku_count: 1, entry_count: 1, user_count: 1 });
+    assert.equal(pendingWaiting.body.gifts.find((item) => item.gift_name === "候场人气票").count, 42);
     assert.equal(pendingWaiting.body.danmaku[0].content, "开播前先来打个招呼");
     const pendingWaitingByInternalId = await request(app).get(`/api/rooms/${created.body.id}/waiting-events`).expect(200);
     assert.deepEqual(pendingWaitingByInternalId.body.counts, pendingWaiting.body.counts, "兼容旧页面使用数据库内部 ID 请求候场数据");
@@ -622,9 +683,10 @@ describe("administration and ingestion", () => {
     assert.equal(room.body.sessions.length, 1);
     const session = room.body.sessions[0];
     const waiting = await request(app).get(`/api/sessions/${session.id}/waiting-events`).expect(200);
-    assert.deepEqual(waiting.body.counts, { gift_count: 1, danmaku_count: 1, entry_count: 1, user_count: 1 });
+    assert.deepEqual(waiting.body.counts, { gift_count: 2, danmaku_count: 1, entry_count: 1, user_count: 1 });
     assert.equal(waiting.body.gifts[0].gift_name, "小花花");
     assert.equal(waiting.body.gifts[0].total_value, 2);
+    assert.equal(waiting.body.gifts.find((item) => item.gift_name === "候场人气票").count, 42);
     assert.equal(waiting.body.danmaku[0].content, "开播前先来打个招呼");
     assert.equal(waiting.body.viewers[0].username, "候场观众");
     assert.equal(waiting.body.viewers[0].entry_count, 1);
@@ -960,6 +1022,34 @@ describe("administration and ingestion", () => {
       timestamp: 1_752_688_104_000,
       coin_type: "gold",
     });
+    connection.handler.raw.SEND_GIFT_V2({
+      pb: encodeGiftV2Payload({
+        uid: 10210001,
+        uname: "1021Official",
+        face: "https://i0.hdslb.com/bfs/face/gift-v2-avatar.jpg",
+        gifts: [{
+          id: 33988,
+          name: "人气票",
+          count: 42,
+          coinType: "silver",
+          timestamp: Math.floor(1_752_688_105_000 / 1000),
+          tid: "gift-v2-popularity-ticket",
+          icon: "https://s1.hdslb.com/bfs/live/popularity-ticket.png",
+        }],
+      }),
+    });
+    connection.handler.onGift({
+      id: "legacy-copy-of-gift-v2",
+      timestamp: 1_752_688_105_000,
+      raw: { tid: "gift-v2-popularity-ticket" },
+      body: {
+        user: { uid: 10210001, uname: "1021Official", face: "" },
+        gift_name: "人气票",
+        coin_type: "silver",
+        price: 0,
+        amount: 42,
+      },
+    });
 
     const danmaku = await request(app).get(`/api/sessions/${session.id}/danmaku?q=${encodeURIComponent("WebSocket 采集成功")}`).expect(200);
     assert.equal(danmaku.body.total, 1);
@@ -982,14 +1072,18 @@ describe("administration and ingestion", () => {
     assert.equal(gifts.body.gifts.find((item) => item.gift_name === "舰长").total_value, 138);
     assert.equal(gifts.body.gifts.find((item) => item.gift_name === "小心心").total_value, 0.1);
     assert.equal(gifts.body.gifts.find((item) => item.gift_name === "醒目留言").total_value, 30);
+    assert.equal(gifts.body.gifts.find((item) => item.gift_name === "人气票").count, 42);
+    assert.equal(gifts.body.gifts.find((item) => item.gift_name === "人气票").total_value, 0);
+    assert.equal(gifts.body.ranking.find((item) => item.username === "1021Official").gift_count, 42);
     assert.equal(gifts.body.history.find((item) => item.gift_name === "小花花").gift_icon_url, "https://s1.hdslb.com/bfs/live/gift-small-flower.png");
     assert.equal(gifts.body.history.find((item) => item.gift_name === "舰长").username, "上舰测试观众");
     assert.equal(gifts.body.history.find((item) => item.gift_name === "小心心").username, "一电池测试观众");
+    assert.equal(gifts.body.history.find((item) => item.gift_name === "人气票").gift_icon_url, "https://s1.hdslb.com/bfs/live/popularity-ticket.png");
 
     const monitor = await agent.get("/api/admin/monitor").expect(200);
     const status = monitor.body.danmaku.rooms.find((item) => item.room_number === "7788");
     assert.equal(status.status, "listening");
-    assert.equal(status.message_count, 7);
+    assert.equal(status.message_count, 8);
     assert.equal(status.heartbeat_status, "healthy");
     assert.ok(status.last_heartbeat_at);
 
@@ -1004,7 +1098,7 @@ describe("administration and ingestion", () => {
     const recoveredStatus = recoveredMonitor.body.danmaku.rooms.find((item) => item.room_number === "7788");
     assert.equal(recoveredStatus.status, "listening");
     assert.equal(recoveredStatus.last_error, "");
-    assert.equal(recoveredStatus.message_count, 8);
+    assert.equal(recoveredStatus.message_count, 9);
     connection.handler.onAttentionChange({ body: { attention: 2048 } });
 
     const missingAvatarUser = { uid: 889900, uname: "等待头像补全", face: "", identity: { guard_level: 0 } };

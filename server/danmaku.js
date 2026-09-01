@@ -1,6 +1,7 @@
 import { startListen } from "blive-message-listener";
 import { parseBilibiliCookie } from "./bilibili-auth.js";
 import { fetchBilibiliUserProfiles } from "./bilibili-profile.js";
+import { decodeSendGiftV2 } from "./bilibili-gift-v2.js";
 
 const PROFILE_BATCH_SIZE = 20;
 const PROFILE_BATCH_DELAY = 15_000;
@@ -658,6 +659,51 @@ export class DanmakuCollector {
         this.cancelPendingRecovery(connection);
       },
       raw: {
+        SEND_GIFT_V2: (raw) => {
+          let gifts;
+          try {
+            gifts = decodeSendGiftV2(raw?.pb);
+          } catch (error) {
+            this.logger.warn?.(`[danmaku] invalid SEND_GIFT_V2 payload in room ${room.room_number}: ${error.message}`);
+            return;
+          }
+          gifts.forEach((gift, index) => {
+            const stableId = gift.tid || gift.rnd;
+            const syntheticMessage = {
+              id: stableId || "",
+              timestamp: gift.timestamp || Date.now(),
+              body: {
+                user: {
+                  uid: gift.uid,
+                  uname: gift.uname,
+                  face: gift.face,
+                  identity: { guard_level: gift.guard_level },
+                },
+                gift_name: gift.gift_name,
+                amount: gift.num,
+                coin_type: gift.coin_type,
+                price: gift.price,
+                timestamp: gift.timestamp,
+              },
+              raw: gift,
+            };
+            // Use the legacy prefix as well so a gray-release room emitting both formats is not double-counted.
+            const tradeId = stableId ? giftTradeId("gift", syntheticMessage, syntheticMessage.body, gift) : "";
+            if (!rememberGiftTrade(tradeId)) return;
+            const resolvedGiftName = giftName(syntheticMessage.body, gift);
+            if (!resolvedGiftName) return;
+            ingest({
+              type: "gift",
+              timestamp: giftTimestamp(syntheticMessage, syntheticMessage.body, gift),
+              user: normalizeGiftUser(syntheticMessage, syntheticMessage.body, gift, `gift-v2-${index}`),
+              gift_name: resolvedGiftName,
+              gift_icon_url: messageGiftIcon(syntheticMessage, syntheticMessage.body, gift),
+              count: giftCount(syntheticMessage.body, gift),
+              unit_price: giftUnitPrice(syntheticMessage.body, gift),
+              trade_id: tradeId,
+            });
+          });
+        },
         COMBO_SEND: (raw) => {
           const syntheticMessage = { id: raw.combo_id || raw.batch_combo_id || raw.rnd || "combo", timestamp: raw.timestamp || raw.tid || Date.now(), body: {}, raw };
           const tradeId = giftTradeId("gift", syntheticMessage, syntheticMessage.body, raw);
