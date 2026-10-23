@@ -1162,6 +1162,83 @@ describe("administration and ingestion", () => {
     assert.equal(staleResult.body.total, 0);
   });
 
+  test("force-reconnects a heartbeating connection that stops delivering danmaku", async () => {
+    bilibiliSnapshot = {
+      bili_uid: "889911",
+      streamer_name: "静默看门狗主播",
+      avatar_url: "",
+      live_status: 1,
+      title: "静默看门狗场次",
+      cover_url: "",
+      area: "聊天电台",
+      parent_area: "娱乐",
+      live_time: "2026-07-16T12:00:00.000Z",
+      attention: 512,
+      online: 128,
+    };
+    await loginAdmin();
+    const created = await agent.post("/api/admin/rooms").send({
+      room_number: "9911",
+      alias: "silence-watchdog",
+      streamer_name: "",
+      avatar_url: "",
+      description: "",
+      enabled: true,
+    }).expect(201);
+    const room = await request(app).get("/api/rooms/silence-watchdog").expect(200);
+    const session = room.body.sessions.find((item) => item.status === "live");
+    app.locals.danmakuCollector.reconcile();
+
+    const connection = danmakuConnections.find((item) => String(item.roomNumber) === "9911");
+    assert.ok(connection);
+    connection.handler.onOpen();
+    connection.handler.onStartListen();
+    const user = { uid: 445566, uname: "静默测试观众", face: "", identity: { guard_level: 0 } };
+    connection.handler.onIncomeDanmu({ id: "watchdog-danmaku", timestamp: 1_752_688_100_000, body: { timestamp: 1_752_688_100_000, user, content: "看门狗基准弹幕" } });
+
+    const monitored = (await agent.get("/api/admin/monitor").expect(200)).body.danmaku.rooms.find((item) => item.room_number === "9911");
+    assert.equal(monitored.danmaku_silence_status, "active");
+    assert.equal(monitored.silence_restart_count, 0);
+
+    // Heartbeats keep flowing (Bilibili HEARTBEAT -> onAttentionChange), so the
+    // heartbeat watchdog stays "healthy" while no danmaku arrives at all.
+    const live = app.locals.danmakuCollector.connections.get(created.body.id);
+    connection.handler.onAttentionChange({ body: { attention: 512 } });
+    assert.equal(app.locals.danmakuCollector.heartbeatStatus(live), "healthy");
+
+    // The silence clock is anchored on max(lastDanmakuAt, connectedAt), so both
+    // must age: the socket has been up a long time and still heartbeats.
+    live.connectedAt = new Date(Date.now() - 16 * 60_000).toISOString();
+    live.lastDanmakuAt = new Date(Date.now() - 16 * 60_000).toISOString();
+    connection.handler.onAttentionChange({ body: { attention: 512 } });
+    assert.equal(app.locals.danmakuCollector.danmakuSilenceSeconds(live) >= 900, true);
+    assert.equal(app.locals.danmakuCollector.heartbeatStatus(live), "healthy");
+    app.locals.danmakuCollector.reconcile();
+
+    const replacement = danmakuConnections.filter((item) => String(item.roomNumber) === "9911").at(-1);
+    assert.notEqual(replacement, connection);
+    assert.equal(connection.closed, true);
+    const afterSilence = (await agent.get("/api/admin/monitor").expect(200)).body.danmaku.rooms.find((item) => item.room_number === "9911");
+    assert.equal(afterSilence.silence_restart_count, 1);
+    assert.ok(afterSilence.last_silence_recovery_at);
+
+    // The cooldown prevents a reconnect storm: the fresh connection is not
+    // immediately reaped again even though it has no danmaku yet.
+    replacement.handler.onOpen();
+    replacement.handler.onStartListen();
+    app.locals.danmakuCollector.reconcile();
+    assert.equal(danmakuConnections.filter((item) => String(item.roomNumber) === "9911").at(-1), replacement);
+    assert.equal(app.locals.danmakuCollector.connections.get(created.body.id).silenceRestartCount, 1);
+
+    // A real danmaku resets the silence clock.
+    replacement.handler.onIncomeDanmu({ id: "watchdog-recovered", timestamp: 1_752_688_101_000, body: { timestamp: 1_752_688_101_000, user, content: "看门狗恢复弹幕" } });
+    const recovered = (await agent.get("/api/admin/monitor").expect(200)).body.danmaku.rooms.find((item) => item.room_number === "9911");
+    assert.equal(recovered.danmaku_silence_status, "active");
+    assert.ok(recovered.last_danmaku_at);
+    const stored = await request(app).get(`/api/sessions/${session.id}/danmaku?q=${encodeURIComponent("看门狗恢复弹幕")}`).expect(200);
+    assert.equal(stored.body.total, 1);
+  });
+
   test("configuration switch disables room mutations", async () => {
     await loginAdmin();
     const config = await agent.get("/api/admin/config").expect(200);

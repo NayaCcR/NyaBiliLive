@@ -12,6 +12,11 @@ const HEARTBEAT_TIMEOUT = 120_000;
 const RECONNECT_BASE_DELAY = 30_000;
 const RECONNECT_MAX_DELAY = 5 * 60_000;
 const MANUAL_RESTART_COOLDOWN = 30_000;
+// A live room that is connected and heartbeating but delivers no danmaku for
+// this long is treated as a half-dead websocket and force-reconnected, because
+// HEARTBEAT packets alone cannot prove the danmaku channel still works.
+const DANMAKU_SILENCE_TIMEOUT = 15 * 60_000;
+const SILENCE_RECOVERY_COOLDOWN = 10 * 60_000;
 
 function toIsoTimestamp(value) {
   const numeric = Number(value || Date.now());
@@ -187,6 +192,7 @@ export class DanmakuCollector {
     this.reconciling = false;
     this.lastReconcileAt = null;
     this.pendingProfileUids = new Set();
+    this.silenceRecovery = new Map();
     this.profileAttempts = new Map();
     this.profileTimer = null;
     this.profileInFlight = false;
@@ -228,6 +234,11 @@ export class DanmakuCollector {
         connected_at: connection.connectedAt,
         last_event_at: connection.lastEventAt,
         last_heartbeat_at: connection.lastHeartbeatAt,
+        last_danmaku_at: connection.lastDanmakuAt,
+        danmaku_silence_seconds: this.danmakuSilenceSeconds(connection),
+        danmaku_silence_status: this.silenceStatus(connection),
+        silence_restart_count: connection.silenceRestartCount,
+        last_silence_recovery_at: connection.lastSilenceRecoveryAt,
         heartbeat_status: this.heartbeatStatus(connection),
         heartbeat_restart_count: connection.heartbeatRestartCount,
         reconnect_failure_streak: connection.reconnectFailureStreak,
@@ -288,6 +299,21 @@ export class DanmakuCollector {
     );
     if (!latestActivity) return "waiting";
     return Date.now() - latestActivity >= HEARTBEAT_TIMEOUT ? "stale" : connection.lastHeartbeatAt ? "healthy" : "waiting";
+  }
+
+  danmakuSilenceSeconds(connection) {
+    const latest = Math.max(
+      Date.parse(connection.lastDanmakuAt || "") || 0,
+      Date.parse(connection.connectedAt || "") || 0,
+    );
+    if (!latest) return 0;
+    return Math.max(0, Math.floor((Date.now() - latest) / 1000));
+  }
+
+  silenceStatus(connection) {
+    if (["closed", "error"].includes(connection.status)) return "offline";
+    if (connection.sessionId == null) return "idle";
+    return this.danmakuSilenceSeconds(connection) >= DANMAKU_SILENCE_TIMEOUT / 1000 ? "silent" : "active";
   }
 
   scheduleRecovery(connection, reason, status = "error") {
@@ -413,7 +439,13 @@ export class DanmakuCollector {
       // per-room waiting monitor is enabled, limiting long-lived idle connections.
       const desired = new Map(this.database.listDanmakuMonitorRooms().map((room) => [room.id, room]));
       for (const roomId of this.connections.keys()) {
-        if (!desired.has(roomId)) this.stopRoom(roomId);
+        if (!desired.has(roomId)) {
+          this.stopRoom(roomId);
+          // A room that left the monitor set starts from a clean slate if
+          // it is added again later.
+          this.silenceRecovery.delete(roomId);
+          this.heartbeatRecovery.delete(roomId);
+        }
       }
       for (const room of desired.values()) {
         const current = this.connections.get(room.id);
@@ -428,6 +460,30 @@ export class DanmakuCollector {
           this.scheduleRecovery(current, `心跳或消息已静默 ${elapsed} 秒`);
         } else if (current?.instance?.closed && !["closed", "error"].includes(current.status)) {
           this.scheduleRecovery(current, "底层连接已关闭", "closed");
+        }
+        // Watchdog: a live, heartbeating connection that has delivered no danmaku
+        // for DANMAKU_SILENCE_TIMEOUT is force-reconnected, bypassing the
+        // heartbeat-based recovery path that stays quiet while HEARTBEAT flows.
+        const silenceSeconds = current ? this.danmakuSilenceSeconds(current) : 0;
+        const silenceWatchdogDue = Boolean(current)
+          && current.sessionId != null
+          && silenceSeconds >= DANMAKU_SILENCE_TIMEOUT / 1000
+          && (!current.lastSilenceRecoveryAt
+            || Date.now() - Date.parse(current.lastSilenceRecoveryAt) >= SILENCE_RECOVERY_COOLDOWN);
+        if (silenceWatchdogDue) {
+          const record = this.silenceRecovery.get(room.id) || { count: 0, at: null };
+          record.count += 1;
+          record.at = new Date().toISOString();
+          this.silenceRecovery.set(room.id, record);
+          current.silenceRestartCount = record.count;
+          current.lastSilenceRecoveryAt = record.at;
+          this.logger.warn?.(
+            `[danmaku] room ${current.roomNumber}: 静默 ${Math.floor(silenceSeconds)} 秒无弹幕，强制重连`
+            + `（第 ${current.silenceRestartCount} 次）`,
+          );
+          this.stopRoom(room.id);
+          this.startRoom(room);
+          continue;
         }
         const retryReady = current && (!current.retryAt || Date.now() >= current.retryAt);
         const needsRestart = current && (
@@ -455,6 +511,7 @@ export class DanmakuCollector {
 
   startRoom(room) {
     const recovery = this.heartbeatRecovery.get(room.id) || { count: 0, failureStreak: 0, at: null, reason: "" };
+    const silence = this.silenceRecovery.get(room.id) || { count: 0, at: null };
     const connection = {
       roomId: room.id,
       roomNumber: String(room.room_number),
@@ -464,6 +521,9 @@ export class DanmakuCollector {
       connectedAt: null,
       lastEventAt: null,
       lastHeartbeatAt: null,
+      lastDanmakuAt: null,
+      silenceRestartCount: silence.count,
+      lastSilenceRecoveryAt: silence.at,
       heartbeatRestartCount: recovery.count,
       reconnectFailureStreak: recovery.failureStreak,
       lastRecoveryAt: recovery.at,
@@ -494,7 +554,10 @@ export class DanmakuCollector {
       connection.lastEventAt = new Date().toISOString();
       if (countMessage) connection.messageCount += 1;
     };
-    const recordEvent = () => recordActivity(true);
+    const recordEvent = () => {
+      recordActivity(true);
+      if (isCurrent()) connection.lastDanmakuAt = new Date().toISOString();
+    };
     const recordHeartbeat = () => {
       if (!isCurrent()) return;
       clearHandshakeTimer();
