@@ -1,0 +1,28 @@
+[Unit]
+Description=NyaBiliLive - Bilibili live session archive and danmaku collector
+Documentation=https://github.com/NayaCcR/NyaBiliLive
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/server/NyaBiliLive
+Environment=NODE_ENV=production
+# Keep the durable application log independent from any panel-managed stdout
+# file: BaoTa truncates /www/wwwlogs/nodejs/NyaBiliLive.log on every restart.
+Environment=NYABILILIVE_LOG_DIR=/server/NyaBiliLive/data/logs
+ExecStart=/usr/bin/node server/index.js
+# A crash must always come back: the 2026-10-15 danmaku outage lasted eight
+# days precisely because nothing restarted the process.
+Restart=always
+RestartSec=5
+# Give the danmaku collector a chance to close its websockets cleanly.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+StandardOutput=append:/server/NyaBiliLive/data/logs/stdout.log
+StandardError=append:/server/NyaBiliLive/data/logs/stderr.log
+SyslogIdentifier=nyabililive
+
+[Install]
+WantedBy=multi-user.target
