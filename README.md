@@ -145,3 +145,40 @@ pnpm test
 ```
 
 测试使用临时 SQLite 数据库，覆盖公开查询、用户筛选、后台鉴权、配置权限开关和采集写入。
+
+## 部署与守护
+
+线上进程**必须**由 systemd 托管。历史上它是由手工 `npm run start` 拉起的（PPID=1，无
+systemd 单元、无 pm2、无 cron 守护），进程一旦退出就没有任何东西把它拉回来：2026-10-15
+弹幕采集连接进入「心跳正常但收不到弹幕」的半死状态后，弹幕、候场和用户监控断流了八天。
+
+```bash
+sudo bash deploy/install-service.sh /server/NyaBiliLive
+```
+
+脚本会按实际路径渲染 `deploy/nyabililive.service`、停掉遗留的手工进程、`enable` 并重启服务。
+单元配置 `Restart=always` / `RestartSec=5`，因此崩溃或 OOM 后 5 秒内自动恢复。
+
+常用命令：
+
+```bash
+systemctl status nyabililive
+systemctl restart nyabililive
+journalctl -u nyabililive -f
+tail -f /server/NyaBiliLive/data/logs/nyabililive.log
+```
+
+### 日志
+
+应用自身写 `data/logs/nyabililive.log`（超过 10MB 轮转到 `.log.1`），**不要**只看面板的
+`/www/wwwlogs/nodejs/*.log`——宝塔每次启动都会截断它，断流期间的历史证据会随之丢失。
+可用 `NYABILILIVE_LOG_DIR` 覆盖日志目录。
+
+### 弹幕静默看门狗
+
+`server/danmaku.js` 在心跳之外单独跟踪 `lastDanmakuAt`：连接存活、HEARTBEAT 正常，但连续
+15 分钟没有弹幕时强制重连，10 分钟冷却防止重连风暴。管理接口
+`GET /api/admin/monitor` 的每个房间会给出 `last_danmaku_at`、`danmaku_silence_seconds`、
+`danmaku_silence_status`（`active` / `silent` / `idle` / `offline`）、`silence_restart_count`
+和 `last_silence_recovery_at`，可据此判断采集是否真的在工作。
+
