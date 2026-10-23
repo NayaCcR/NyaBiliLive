@@ -12,6 +12,7 @@ import { BarkNotifier } from "./bark.js";
 import { BilibiliAuthClient } from "./bilibili-auth.js";
 import { DanmakuCollector } from "./danmaku.js";
 import { BilibiliMediaProxy } from "./media.js";
+import { createFileLogger, createNoopLogger } from "./logger.js";
 import { ConfigStore } from "./config.js";
 import { matchOcrWithXml, OcrService, parseOcrSupplementText } from "./supplements.js";
 import {
@@ -31,6 +32,7 @@ const rootDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)),
 const defaultConfigPath = path.join(rootDirectory, "config.json");
 const defaultDatabasePath = path.join(rootDirectory, "data", "nyabililive.db");
 const staticDirectory = path.join(rootDirectory, "static");
+const defaultLogDirectory = path.join(rootDirectory, "data", "logs");
 const environment = typeof process === "undefined" ? {} : process.env;
 const argumentsList = typeof process === "undefined" ? [] : process.argv;
 const DEFAULT_ADMIN_PASSWORD = "nya123nya321";
@@ -113,6 +115,8 @@ export function createApp({
   configPath = environment.NYABILILIVE_CONFIG || defaultConfigPath,
   seed = true,
   logger = environment.NODE_ENV !== "test",
+  logDirectory = environment.NYABILILIVE_LOG_DIR || defaultLogDirectory,
+  logMaxBytes,
   bilibiliClient,
   bilibiliAuthClient = new BilibiliAuthClient(),
   danmakuListenerFactory,
@@ -126,26 +130,34 @@ export function createApp({
   }
   const config = new ConfigStore(configPath);
   const database = new ArchiveDatabase(databasePath, { seed });
-  const barkNotifier = new BarkNotifier({ fetchImpl: barkFetch, logger: logger ? console : { warn() {} } });
+  // Managed panels truncate their own stdout/stderr file on every restart,
+  // so keep an independent, rotating log next to the database.
+  const appLogger = logger
+    ? createFileLogger({
+      directory: logDirectory,
+      ...(logMaxBytes ? { maxBytes: logMaxBytes } : {}),
+    })
+    : createNoopLogger();
+  const barkNotifier = new BarkNotifier({ fetchImpl: barkFetch, logger: appLogger });
   const monitor = new BilibiliRoomMonitor({
     database,
     config,
     client: bilibiliClient,
     notifier: barkNotifier,
-    logger: logger ? console : { warn() {} },
+    logger: appLogger,
   });
   const danmakuCollector = new DanmakuCollector({
     database,
     config,
     listenerFactory: danmakuListenerFactory,
     profileFetcher: bilibiliUserProfileFetcher,
-    logger: logger ? console : { info() {}, warn() {} },
+    logger: appLogger,
   });
   const mediaProxy = new BilibiliMediaProxy({ fetchImpl: mediaFetch });
   const ocrService = new OcrService({
     recognizer: ocrRecognizer,
     cachePath: path.join(path.dirname(path.resolve(databasePath)), "ocr-cache"),
-    logger: logger ? console : { info() {}, warn() {} },
+    logger: appLogger,
   });
   let authMaintenanceInFlight = false;
   let lastAuthMaintenance = null;
@@ -188,6 +200,7 @@ export function createApp({
   app.locals.bilibiliAuthClient = bilibiliAuthClient;
   app.locals.barkNotifier = barkNotifier;
   app.locals.ocrService = ocrService;
+  app.locals.logger = appLogger;
   app.locals.maintainBilibiliAuth = maintainBilibiliAuth;
   app.disable("x-powered-by");
   app.use(helmet({
@@ -828,10 +841,14 @@ export function createApp({
         : "房间号、别名或记录标识已存在";
       return response.status(409).json({ error: message });
     }
-    if (logger && (!error.status || error.status >= 500)) console.error(error);
+    if (logger && (!error.status || error.status >= 500)) appLogger.error(error);
     return response.status(error.status || 500).json({ error: error.status ? error.message : "服务器处理请求时发生错误" });
   });
 
+  if (logger) {
+    process.on("unhandledRejection", (reason) => appLogger.error("[process] unhandledRejection", reason));
+    process.on("uncaughtException", (error) => appLogger.error("[process] uncaughtException", error));
+  }
   return app;
 }
 
@@ -841,19 +858,21 @@ export function startServer(options = {}) {
   const host = environment.HOST || config.app.host;
   const port = Number(environment.PORT || config.app.port);
   const server = app.listen(port, host, () => {
-    console.log(`NyaBiliLive running at http://${host}:${port}`);
+    app.locals.logger.info(`NyaBiliLive running at http://${host}:${port}`);
+    if (app.locals.logger.path) app.locals.logger.info(`日志文件: ${app.locals.logger.path}`);
     app.locals.monitor.start();
     app.locals.danmakuCollector.start();
-    void app.locals.maintainBilibiliAuth().catch((error) => console.warn(`[bilibili-auth] ${error.message}`));
+    void app.locals.maintainBilibiliAuth().catch((error) => app.locals.logger.warn(`[bilibili-auth] ${error.message}`));
   });
   const authMaintenanceTimer = setInterval(() => {
-    void app.locals.maintainBilibiliAuth().catch((error) => console.warn(`[bilibili-auth] ${error.message}`));
+    void app.locals.maintainBilibiliAuth().catch((error) => app.locals.logger.warn(`[bilibili-auth] ${error.message}`));
   }, 24 * 60 * 60 * 1000);
   authMaintenanceTimer.unref?.();
   server.on("close", () => {
     app.locals.monitor.stop();
     app.locals.danmakuCollector.stop();
     void app.locals.ocrService.close();
+    app.locals.logger.close();
     clearInterval(authMaintenanceTimer);
   });
   return { app, server };
